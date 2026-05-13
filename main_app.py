@@ -611,16 +611,16 @@ class MainForm(QMainWindow):
         """对应 BufferedAiCtrl1DataReady — 核心算法"""
         try:
             ch_count = self.daq.channel_count
-            if count < ch_count:
-                return
             j = count // ch_count
+            if j < 1:
+                return
 
             # ---- 1) 读取数据 ----
             data = self.daq.get_data(count)
             if data is None or len(data) == 0:
                 return
 
-            # ---- 2) 电压标定 V → 应变单位 ----
+            # ---- 2) 电压标定 V → 物理单位 ----
             data = data * g.TransPara1
 
             # ---- 3) 拆分通道 ----
@@ -637,7 +637,7 @@ class MainForm(QMainWindow):
             self.data_arrays[1] = data[speed_idx::ch_count][:j].copy()
 
             # 应变通道均值、转速通道平均电压
-            mean_strain = float(np.mean(self.data_arrays[0]))
+            mean_value = float(np.mean(self.data_arrays[0]))
             sum1 = float(np.sum(self.data_arrays[1])) / (j * g.TransPara1)   # 还原成电压
 
             # ---- 4) 实时转速 ----
@@ -650,7 +650,7 @@ class MainForm(QMainWindow):
                 g.Realspeed = 0.0
             g.Realspeed += g.SpeedfixNum
 
-            self.lbl_strain[1].setText(f'{mean_strain:.4f}')
+            self.lbl_strain[1].setText(f'{mean_value:.4f}')
             self.lbl_speed[1].setText(f'{g.Realspeed:.1f}')
 
             # ---- 5) 应变/转速趋势曲线 ----
@@ -660,7 +660,7 @@ class MainForm(QMainWindow):
                 xs_s = np.array([])
                 ys_s = np.array([])
             xs_s = np.append(xs_s, t_now)
-            ys_s = np.append(ys_s, mean_strain)
+            ys_s = np.append(ys_s, mean_value)
             self.curve_strain.setData(xs_s, ys_s)
 
             xs_r, ys_r = self.curve_speed.getData()
@@ -675,7 +675,7 @@ class MainForm(QMainWindow):
             if g.DataSaveFlag and self.csv_file is not None:
                 elapsed = time.time() - self.tick_count
                 self.csv_file.write(
-                    f'{elapsed:.4f} {mean_strain:.4f} {g.Realspeed:.4f}\n'
+                    f'{elapsed:.4f} {mean_value:.4f} {g.Realspeed:.4f}\n'
                 )
                 self.csv_file.flush()
                 if g.Savetime > 0:

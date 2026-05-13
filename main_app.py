@@ -221,7 +221,7 @@ class MainForm(QMainWindow):
 
         # 顶部数值显示行
         top = QHBoxLayout()
-        self.lbl_strain = self._make_indicator('实时应变 με', '0')
+        self.lbl_strain = self._make_indicator('实时应变(标定值)', '0')
         self.lbl_speed = self._make_indicator('实时转速 RPM', '0')
         for w in [self.lbl_strain, self.lbl_speed]:
             top.addWidget(w[0])
@@ -259,7 +259,7 @@ class MainForm(QMainWindow):
         grp_strain = QGroupBox('应变趋势 vs 时间')
         gt = QVBoxLayout(grp_strain)
         self.plot_strain = pg.PlotWidget()
-        self.plot_strain.setLabel('left', '应变', units='με')
+        self.plot_strain.setLabel('left', '应变', units='标定')
         self.plot_strain.setLabel('bottom', '时间', units='s')
         self.plot_strain.showGrid(x=True, y=True, alpha=0.3)
         self.curve_strain = self.plot_strain.plot([], [], pen=pg.mkPen('#2ca02c', width=2))
@@ -613,6 +613,7 @@ class MainForm(QMainWindow):
             ch_count = self.daq.channel_count
             j = count // ch_count
             if j <= 0:
+                # 缓冲不足时跳过本次处理
                 return
 
             # ---- 1) 读取数据 ----
@@ -620,7 +621,7 @@ class MainForm(QMainWindow):
             if data is None or len(data) == 0:
                 return
 
-            # ---- 2) 电压标定 V → 标定单位(当前按应变 με 显示) ----
+            # ---- 2) 电压标定 V → 传感器标定单位(单位由灵敏度设置决定) ----
             data = data * g.TransPara1
 
             # ---- 3) 拆分通道 ----
@@ -636,7 +637,7 @@ class MainForm(QMainWindow):
             self.data_arrays[0] = data[freq_idx::ch_count][:j].copy()
             self.data_arrays[1] = data[speed_idx::ch_count][:j].copy()
 
-            # 应变通道取均值、转速通道取平均电压
+            # 应变通道取均值(单位随标定)、转速通道取平均电压
             strain_value = float(np.mean(self.data_arrays[0]))
             sum1 = float(np.sum(self.data_arrays[1])) / (j * g.TransPara1)   # 还原成电压
 

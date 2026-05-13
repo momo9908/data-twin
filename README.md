@@ -104,7 +104,7 @@ USB-4716 (8 通道 × 10 kHz 采样)
         ↓ DMA → DAQNavi Driver
 BufferedAiCtrl 缓冲 (16384 点)
         ↓ 每 8192 点触发 DataReady
-get_data → np.array (V) → × TransPara1 → (应变单位)
+get_data → np.array (V) → × TransPara1 → (标定单位)
         ↓
 拆分: 通道0=应变, 通道7=转速
         ↓

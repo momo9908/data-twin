@@ -149,9 +149,6 @@ class MainForm(QMainWindow):
         # 原始拼合数据(交错格式)
         self.data_scaled = np.zeros(0)
 
-        # 实时显示值
-        self.current_strain: float = 0.0
-        self.current_speed: float = 0.0
 
         # 文件
         self.csv_file = None          # 数据 CSV 文件句柄
@@ -224,7 +221,7 @@ class MainForm(QMainWindow):
 
         # 顶部数值显示行
         top = QHBoxLayout()
-        self.lbl_strain = self._make_indicator('实时应变 μm', '0')
+        self.lbl_strain = self._make_indicator('实时应变 με', '0')
         self.lbl_speed = self._make_indicator('实时转速 RPM', '0')
         for w in [self.lbl_strain, self.lbl_speed]:
             top.addWidget(w[0])
@@ -262,7 +259,7 @@ class MainForm(QMainWindow):
         grp_strain = QGroupBox('应变趋势 vs 时间')
         gt = QVBoxLayout(grp_strain)
         self.plot_strain = pg.PlotWidget()
-        self.plot_strain.setLabel('left', '应变', units='μm')
+        self.plot_strain.setLabel('left', '应变', units='με')
         self.plot_strain.setLabel('bottom', '时间', units='s')
         self.plot_strain.showGrid(x=True, y=True, alpha=0.3)
         self.curve_strain = self.plot_strain.plot([], [], pen=pg.mkPen('#2ca02c', width=2))
@@ -468,8 +465,6 @@ class MainForm(QMainWindow):
             ic = self.daq.interval_count
             self.data_arrays = [np.zeros(ic) for _ in range(8)]
 
-            self.current_strain = 0.0
-            self.current_speed = 0.0
             self.curve_strain.setData([], [])
             self.curve_speed.setData([], [])
             self.tick_count1 = time.time()
@@ -616,16 +611,16 @@ class MainForm(QMainWindow):
         """对应 BufferedAiCtrl1DataReady — 核心算法"""
         try:
             ch_count = self.daq.channel_count
-            j = count // ch_count
-            if j <= 0:
+            if count < ch_count:
                 return
+            j = count // ch_count
 
             # ---- 1) 读取数据 ----
             data = self.daq.get_data(count)
             if data is None or len(data) == 0:
                 return
 
-            # ---- 2) 电压标定 V → μm ----
+            # ---- 2) 电压标定 V → 应变单位 ----
             data = data * g.TransPara1
 
             # ---- 3) 拆分通道 ----
@@ -641,7 +636,7 @@ class MainForm(QMainWindow):
             self.data_arrays[0] = data[freq_idx::ch_count][:j].copy()
             self.data_arrays[1] = data[speed_idx::ch_count][:j].copy()
 
-            # 应变通道均值、转速通道均值
+            # 应变通道均值、转速通道平均电压
             mean_strain = float(np.mean(self.data_arrays[0]))
             sum1 = float(np.sum(self.data_arrays[1])) / (j * g.TransPara1)   # 还原成电压
 
@@ -655,8 +650,6 @@ class MainForm(QMainWindow):
                 g.Realspeed = 0.0
             g.Realspeed += g.SpeedfixNum
 
-            self.current_strain = mean_strain
-            self.current_speed = g.Realspeed
             self.lbl_strain[1].setText(f'{mean_strain:.4f}')
             self.lbl_speed[1].setText(f'{g.Realspeed:.1f}')
 

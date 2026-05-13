@@ -159,6 +159,11 @@ class MainForm(QMainWindow):
         self.tick_count = time.time()      # 数据保存起点
         self.tick_count1 = time.time()     # XY 曲线起点
 
+        # 单位配置(与传感器灵敏度选项对应)
+        # 0/3: 加速度 (m/s²), 1: 通用 mV/V, 2/4: 标定值, 5: 位移 μm
+        self.sensor_units = ['m/s²', 'mV/V', '标定', 'm/s²', '标定', 'μm']
+        self.strain_unit = self.sensor_units[5]
+
         # ---------- 数据采集设备 ----------
         self.daq = create_daq_device()
         self.daq.set_on_data_ready(self._raise_data_ready)
@@ -221,7 +226,7 @@ class MainForm(QMainWindow):
 
         # 顶部数值显示行
         top = QHBoxLayout()
-        self.lbl_strain = self._make_indicator('实时应变(标定值)', '0')
+        self.lbl_strain = self._make_indicator(f'实时应变({self.strain_unit})', '0')
         self.lbl_speed = self._make_indicator('实时转速 RPM', '0')
         for w in [self.lbl_strain, self.lbl_speed]:
             top.addWidget(w[0])
@@ -259,7 +264,7 @@ class MainForm(QMainWindow):
         grp_strain = QGroupBox('应变趋势 vs 时间')
         gt = QVBoxLayout(grp_strain)
         self.plot_strain = pg.PlotWidget()
-        self.plot_strain.setLabel('left', '应变', units='标定')
+        self.plot_strain.setLabel('left', '应变', units=self.strain_unit)
         self.plot_strain.setLabel('bottom', '时间', units='s')
         self.plot_strain.showGrid(x=True, y=True, alpha=0.3)
         self.curve_strain = self.plot_strain.plot([], [], pen=pg.mkPen('#2ca02c', width=2))
@@ -349,6 +354,7 @@ class MainForm(QMainWindow):
         self.cb_sens.setCurrentIndex(5)
         self.cb_sens.currentIndexChanged.connect(self._on_cb9_change)
         f2.addRow('传感器灵敏度:', self.cb_sens)
+        self._update_strain_unit(self.sensor_units[self.cb_sens.currentIndex()])
 
         outer.addWidget(grp_sens)
 
@@ -384,6 +390,14 @@ class MainForm(QMainWindow):
         lbl.setStyleSheet('font-size: 24px; font-weight: bold; color: #1f77b4;')
         v.addWidget(lbl)
         return (gb, lbl)
+
+    def _update_strain_unit(self, unit: str):
+        """同步应变显示的单位"""
+        self.strain_unit = unit
+        if hasattr(self, 'lbl_strain'):
+            self.lbl_strain[0].setTitle(f'实时应变({unit})')
+        if hasattr(self, 'plot_strain'):
+            self.plot_strain.setLabel('left', '应变', units=unit)
 
     # ============================================================
     # FormCreate —— 启动初始化
@@ -591,6 +605,8 @@ class MainForm(QMainWindow):
         if 0 <= idx < len(table):
             g.Sensitivity1 = table[idx]
             g.TransPara1 = 1000.0 / g.Sensitivity1
+            if 0 <= idx < len(self.sensor_units):
+                self._update_strain_unit(self.sensor_units[idx])
 
     def _on_cb8_change(self, txt):
         try:

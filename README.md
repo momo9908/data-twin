@@ -1,17 +1,17 @@
 # 涡轮超速预应力评估测试控制系统 (Python 版)
 
-研华 USB-4716 数据采集卡 + 振动 FFT 分析 + 变形线性拟合 + CSV 数据记录
-的完整 Python 实现 — 由原 Delphi 项目移植。
+研华 USB-4716 数据采集卡 + 应变/转速实时显示 + CSV 数据记录
+的完整 Python 实现 — 由原 Delphi 项目移植并精简功能。
 
 ## 📦 项目结构
 
 ```
 turbine_test/
 ├── public_para.py    # 全局共享参数 (对应 PublicPara.pas)
-├── complexs.py       # 复数运算 (对应 Complexs.pas)
-├── ffts.py           # FFT 算法 (对应 FFTs.pas, 使用 numpy)
+├── complexs.py       # 复数运算(历史模块,当前流程不使用)
+├── ffts.py           # FFT 算法(历史模块,当前流程不使用)
 ├── daq_device.py     # USB-4716 设备接入 + 模拟器
-├── main_app.py       # 主程序 / 主窗口 (对应 Main.pas + 部分 DaqUtils)
+├── main_app.py       # 主程序 / 主窗口 (应变/转速实时显示)
 ├── Sysdata/
 │   └── DeviceSet.txt # 硬件标定参数
 └── README.md
@@ -78,14 +78,9 @@ python main_app.py
 |---|---|
 | BufferedAiCtrl 设备配置 | `DaqDevice.configure_*` |
 | OnDataReady 数据回调 | `_on_data_ready` (Qt 信号桥接, 线程安全) |
-| iPlot1 频谱图 | `plot1` (pyqtgraph, 双 Y 轴幅值+相位) |
-| iPlot2 振动趋势 | `plot2` (附鼠标悬停回放) |
-| iPlot3 即时频谱 | `plot3` |
-| iXYPlot1 变形-转速² | `plotxy` (散点 + 拟合直线) |
-| ForwardFFT/InverseFFT | `numpy.fft.fft/ifft` |
-| 最小二乘拟合 (Button2) | `_btn_fit_click` (与原算法等价) |
+| 应变趋势显示 | `plot_strain` |
+| 转速趋势显示 | `plot_speed` |
 | DataSaveFlag CSV | `csv_file.write(...)` |
-| 瀑布图导出 | `_btn_export_waterfall_click` |
 | SpeedFix 子窗口 | `SpeedFixDialog` (QDialog) |
 | 转速修正菜单 N1 | "设置 → 转速参数标定" |
 
@@ -109,16 +104,14 @@ USB-4716 (8 通道 × 10 kHz 采样)
         ↓ DMA → DAQNavi Driver
 BufferedAiCtrl 缓冲 (16384 点)
         ↓ 每 8192 点触发 DataReady
-get_data → np.array (V) → × TransPara1 → (μm)
+get_data → np.array (V) → × TransPara1 → (应变单位)
         ↓
-拆分: 通道0=振动, 通道7=转速
+拆分: 通道0=应变, 通道7=转速
         ↓
-振动: FFT → 频域带阻[StopFreqLow..StopFreqHigh] → IFFT → 峰峰值 Vib1
+应变: 通道均值作为实时应变
 转速: 平均电压 → 线性映射 → Realspeed (RPM)
-位移: Dis2 = -mean(recovered)
         ↓
-显示: 频谱图 / 趋势图 / XY 变形图
-拟合: Deformation = Fxa × (RPM²/10⁶) + Fxb
+显示: 应变趋势图 / 转速趋势图
 存盘: data\YYYYMMDDxx\xxxxx.CSV
 ```
 

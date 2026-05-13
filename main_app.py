@@ -617,12 +617,12 @@ class MainForm(QMainWindow):
         try:
             ch_count = self.daq.channel_count
             j = count // ch_count
+            if j <= 0:
+                return
 
             # ---- 1) 读取数据 ----
             data = self.daq.get_data(count)
             if data is None or len(data) == 0:
-                return
-            if j <= 0:
                 return
 
             # ---- 2) 电压标定 V → μm ----

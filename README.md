@@ -8,8 +8,8 @@
 ```
 turbine_test/
 ├── public_para.py    # 全局共享参数 (对应 PublicPara.pas)
-├── complexs.py       # 复数运算(历史模块,当前流程不使用)
-├── ffts.py           # FFT 算法(历史模块,当前流程不使用)
+├── complexs.py       # 复数运算(历史模块,保留用于 test_algorithms.py)
+├── ffts.py           # FFT 算法(历史模块,保留用于 test_algorithms.py)
 ├── daq_device.py     # USB-4716 设备接入 + 模拟器
 ├── main_app.py       # 主程序 / 主窗口 (应变/转速实时显示)
 ├── Sysdata/

@@ -224,7 +224,7 @@ class MainForm(QMainWindow):
 
         # 顶部数值显示行
         top = QHBoxLayout()
-        self.lbl_strain = self._make_indicator('实时应变', '0')
+        self.lbl_strain = self._make_indicator('实时应变 μm', '0')
         self.lbl_speed = self._make_indicator('实时转速 RPM', '0')
         for w in [self.lbl_strain, self.lbl_speed]:
             top.addWidget(w[0])
@@ -262,7 +262,7 @@ class MainForm(QMainWindow):
         grp_strain = QGroupBox('应变趋势 vs 时间')
         gt = QVBoxLayout(grp_strain)
         self.plot_strain = pg.PlotWidget()
-        self.plot_strain.setLabel('left', '应变')
+        self.plot_strain.setLabel('left', '应变', units='μm')
         self.plot_strain.setLabel('bottom', '时间', units='s')
         self.plot_strain.showGrid(x=True, y=True, alpha=0.3)
         self.curve_strain = self.plot_strain.plot([], [], pen=pg.mkPen('#2ca02c', width=2))
@@ -642,7 +642,7 @@ class MainForm(QMainWindow):
             self.data_arrays[1] = data[speed_idx::ch_count][:j].copy()
 
             # 应变通道均值、转速通道均值
-            strain_value = float(np.mean(self.data_arrays[0]))
+            mean_strain = float(np.mean(self.data_arrays[0]))
             sum1 = float(np.sum(self.data_arrays[1])) / (j * g.TransPara1)   # 还原成电压
 
             # ---- 4) 实时转速 ----
@@ -655,9 +655,9 @@ class MainForm(QMainWindow):
                 g.Realspeed = 0.0
             g.Realspeed += g.SpeedfixNum
 
-            self.current_strain = strain_value
+            self.current_strain = mean_strain
             self.current_speed = g.Realspeed
-            self.lbl_strain[1].setText(f'{strain_value:.4f}')
+            self.lbl_strain[1].setText(f'{mean_strain:.4f}')
             self.lbl_speed[1].setText(f'{g.Realspeed:.1f}')
 
             # ---- 5) 应变/转速趋势曲线 ----
@@ -667,7 +667,7 @@ class MainForm(QMainWindow):
                 xs_s = np.array([])
                 ys_s = np.array([])
             xs_s = np.append(xs_s, t_now)
-            ys_s = np.append(ys_s, strain_value)
+            ys_s = np.append(ys_s, mean_strain)
             self.curve_strain.setData(xs_s, ys_s)
 
             xs_r, ys_r = self.curve_speed.getData()
@@ -682,7 +682,7 @@ class MainForm(QMainWindow):
             if g.DataSaveFlag and self.csv_file is not None:
                 elapsed = time.time() - self.tick_count
                 self.csv_file.write(
-                    f'{elapsed:.4f} {strain_value:.4f} {g.Realspeed:.4f}\n'
+                    f'{elapsed:.4f} {mean_strain:.4f} {g.Realspeed:.4f}\n'
                 )
                 self.csv_file.flush()
                 if g.Savetime > 0:

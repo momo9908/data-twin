@@ -1,56 +1,70 @@
 """
 main_app.py
 ============
-对应 Delphi Main.pas — 涡轮超速预应力评估测试控制系统(完整 Python 版)。
+HRSTD 在线变形测量系统 — 主入口与事件编排。
 
-功能复现:
-  1. 启动时从 Sysdata\\DeviceSet.txt 读取硬件标定参数
-  2. 配置 USB-4716: 8 通道 / 10 kHz / 16384 缓冲 / 8192 间隔
-  3. Start/Pause/Stop 控制实时连续采集
-  4. 数据就绪回调:
-        - 通道拆分 → 电压标定 → 计算转速
-        - FFT → 频域带通滤波 → IFFT → 振动峰峰值
-        - 频谱图(幅值+相位)、振动趋势图、瀑布图缓存
-        - CSV 数据存盘
-  5. Timer2 定时绘制"变形量 vs 转速²"XY 图
-  6. 最小二乘线性拟合得到 Fxa/Fxb
-  7. 鼠标在振动趋势上悬停时,显示对应时刻的频谱
-  8. 导出瀑布图 CSV
-  9. 转速修正子窗口
+本模块经过模块化拆分后, 仅承担:
+  1. 应用程序入口 (main 函数)
+  2. MainForm 信号槽连接与事件编排 (按钮点击 / DAQ 回调 / 定时器)
+  3. 在 MainForm 上挂载 DAQ / CSVLogger / PlotManager / UI 控件
+  4. 共享采集会话管理 (start/pause/stop_session, 径向页与振动页共用一条数据流)
+  5. 关闭时的资源清理
 
-依赖: PyQt5, pyqtgraph, numpy
-   pip install PyQt5 pyqtgraph numpy
+所有具体功能均交由对应模块实现:
+  - dialogs.SpeedFixDialog          : 转速参数标定窗
+  - settings_io.load_device_set     : DeviceSet.txt 读取
+  - ui_builder.build_main_ui        : 主窗口 GUI 构建
+  - data_processor.*                : 数据解算 (转速 / 变形)
+  - csv_logger.CSVLogger / make_dated_folder : CSV 文件生命周期 + 目录
+  - plot_manager.PlotManager        : 散点图 / 拟合线 / 自动缩放 / PNG 导出
+  - daq_device.create_daq_device    : 硬件抽象 (真实 / 模拟)
+  - vibration_tab / vibration_processor : 振动信号分析页 (FFT/带通/瀑布, 复刻 Delphi)
+  - public_para.g                   : 全局参数单例
+
+共享采集会话 (需求确认: 共享一次采集):
+  - 径向页与振动页任一页"开始采集"都调 start_session(initiator), 硬件只有
+    一条数据流; 每帧在 _on_data_ready 中先走径向流水线, 再分发给振动页
+  - 采样率/分析点数以发起方页面的设置为准
+  - 一次会话建一个 data\\YYYYMMDD序号\\ 目录: 径向 <编号>.CSV + <编号>.png,
+    振动 <编号>_vib.CSV + <编号>_spec.png
+  - 任一页"停止"结束整个会话; 振动页"暂停"挂起硬件流 (文件保持打开),
+    其后再按"开始"将静默收尾旧档并新建档案 (对应 Delphi BtnPause 语义)
+
+功能复现 (与重构前等价):
+  - 径向页纯时域处理: 直接取采集均值作为当前间距, 计算变形量
+  - 精确 CSV 输出: UTF-8 with BOM, CRLF, 全角冒号, 去尾零数据
+  - 事件驱动: 散点与参考点累加绑定到 DAQ 数据更新事件
 """
 
 import os
 import sys
 import time
-from datetime import datetime
-from typing import Optional
-
 import numpy as np
 
-from PyQt5.QtCore import Qt, QTimer, QPointF, pyqtSignal, pyqtSlot
-from PyQt5.QtGui import QColor, QPalette
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QTabWidget, QGroupBox,
-    QLabel, QLineEdit, QPushButton, QComboBox, QProgressBar,
-    QHBoxLayout, QVBoxLayout, QGridLayout, QFormLayout,
-    QMessageBox, QFileDialog, QMenuBar, QAction, QStatusBar,
-    QDialog, QDialogButtonBox, QSpinBox, QDoubleSpinBox,
+    QApplication, QMainWindow, QMessageBox,
+    QPushButton, QLineEdit, QComboBox, QProgressBar, QLabel,
 )
-
 import pyqtgraph as pg
 
 # 项目模块
-from public_para import g, cMinFloat, cMaxFloat
-from complexs import ComplexMag, ComplexPhase, Complex, complex_mag_array, complex_phase_array
-from ffts import fft_array, ifft_array
-from daq_device import create_daq_device, DAQNAVI_AVAILABLE
+from public_para import g
+from daq_device import create_daq_device, find_real_device, real_device_present
+from dialogs import SpeedFixDialog
+from settings_io import load_device_set
+from ui_builder import build_main_ui
+from data_processor import (
+    calc_realspeed, calc_deformation, fit_piecewise_power, piecewise_power_curve,
+)
+from csv_logger import CSVLogger, make_dated_folder
+from plot_manager import PlotManager
+from speed_stability import LoadHoldDetector, HoldEvent
+from latency_report import LatencyProbe, LatencyReportWindow
 
 
 # =============================================================================
-# 全局视觉设置(白底,清晰打印)
+# 全局视觉
 # =============================================================================
 pg.setConfigOption('background', 'w')
 pg.setConfigOption('foreground', 'k')
@@ -58,1147 +72,1122 @@ pg.setConfigOption('antialias', True)
 
 
 # =============================================================================
-# 转速修正子窗口(对应 SpeedFix.pas)
-# =============================================================================
-class SpeedFixDialog(QDialog):
-    """转速参数修正对话框(对应 TSpeedFixForm)。
-
-    允许用户编辑 DeviceSet.txt 中的标定参数。
-    """
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle('转速参数设置')
-        self.setFixedSize(380, 240)
-
-        form = QFormLayout()
-
-        self.sp_dev = QSpinBox()
-        self.sp_dev.setRange(0, 31)
-        self.sp_dev.setValue(0)
-        form.addRow('设备号:', self.sp_dev)
-
-        self.sp_vini = QDoubleSpinBox()
-        self.sp_vini.setDecimals(3)
-        self.sp_vini.setRange(-10, 10)
-        self.sp_vini.setValue(g.VoltageIni)
-        form.addRow('零点电压 V(零):', self.sp_vini)
-
-        self.sp_vmax = QDoubleSpinBox()
-        self.sp_vmax.setDecimals(3)
-        self.sp_vmax.setRange(-10, 10)
-        self.sp_vmax.setValue(g.VoltageMax)
-        form.addRow('满量程电压 V(满):', self.sp_vmax)
-
-        self.sp_smax = QDoubleSpinBox()
-        self.sp_smax.setDecimals(0)
-        self.sp_smax.setRange(1, 200000)
-        self.sp_smax.setValue(g.SpeedMax)
-        form.addRow('最大转速 RPM:', self.sp_smax)
-
-        self.sp_sfix = QDoubleSpinBox()
-        self.sp_sfix.setDecimals(1)
-        self.sp_sfix.setRange(-5000, 5000)
-        self.sp_sfix.setValue(g.SpeedfixNum)
-        form.addRow('转速修正量:', self.sp_sfix)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
-        )
-        buttons.accepted.connect(self._on_ok)
-        buttons.rejected.connect(self.reject)
-
-        lay = QVBoxLayout(self)
-        lay.addLayout(form)
-        lay.addWidget(buttons)
-
-    def _on_ok(self):
-        """保存到 DeviceSet.txt 并更新全局变量"""
-        g.VoltageIni = float(self.sp_vini.value())
-        g.VoltageMax = float(self.sp_vmax.value())
-        g.SpeedMax = float(self.sp_smax.value())
-        g.SpeedfixNum = float(self.sp_sfix.value())
-
-        # 写回配置文件
-        try:
-            exe_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-            path = os.path.join(exe_dir, 'Sysdata', 'DeviceSet.txt')
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, 'w', encoding='utf-8') as f:
-                f.write(f'{int(self.sp_dev.value())}\n')
-                f.write(f'{g.VoltageIni}\n')
-                f.write(f'{g.VoltageMax}\n')
-                f.write(f'{g.SpeedMax}\n')
-                f.write(f'{g.SpeedfixNum}\n')
-        except Exception as e:
-            QMessageBox.warning(self, '保存失败', f'写入配置文件失败:\n{e}')
-
-        self.accept()
-
-
-# =============================================================================
-# 主窗口(对应 TMainForm)
+# 主窗口
 # =============================================================================
 class MainForm(QMainWindow):
+    """主窗口: 信号槽连接 + 模块编排薄壳。
 
-    # 用于跨线程触发数据就绪事件(模拟设备在主线程,真硬件可能在其他线程)
+    职责:
+        - 接收 DAQ 回调, 调度 data_processor / plot / csv 处理一帧数据
+        - 处理用户按钮点击, 启停采集 / 归零 / 拟合
+        - 维护采集相关的临时状态 (test_no / bmp_path / tick_count 等)
+
+    维护的状态:
+        - self.exe_directory: exe 所在目录, 用于 make_dated_folder
+        - self.daq:           DAQ 设备 (真实或模拟)
+        - self.csv:           CSVLogger 实例
+        - self.plot:          PlotManager 实例
+        - self.data_arrays:   8 通道临时缓冲数组列表
+        - self.tick_count:    采集起始时间戳 (用于 CSV 列 1)
+        - self.test_no / self.bmp_path: 当前测试编号与截图路径
+        - self.is_first_overrun: 是否首次 overrun 警告
+
+    UI 控件 (由 ui_builder 动态挂载, 类型注解仅供 IDE 提示, 不影响运行):
+    """
+
+    # ==== Qt 信号: DAQ 数据就绪 (跨线程桥) ====
     data_ready_signal = pyqtSignal(int, int)
 
+    # ==== Qt 信号: 判定进入保载 → 投递弹窗 (算法 4.2 的 S3 跨线程投递) ====
+    # 用 QueuedConnection 连接, 即使同线程也延到下一轮事件循环, 实现"入队即返回"
+    hold_entered_signal = pyqtSignal(object)
+
+    # ==== Qt 信号: 采集卡运行中断开 (真卡轮询线程检测到 → 跨线程投递到 GUI 报警) ====
+    disconnect_signal = pyqtSignal()
+
+    # —— 由 ui_builder.build_main_ui(self) 动态注入 ——
+    # 指示器: (QGroupBox, QLabel) 元组
+    lbl_speed:    tuple
+    lbl_dis2:     tuple
+    lbl_def:      tuple
+    lbl_rate:     tuple
+    # 绘图控件
+    plotxy:       pg.PlotWidget
+    scatter_xy:   pg.ScatterPlotItem
+    fit_curve:    pg.PlotDataItem
+    # 下拉框
+    cb_sens:      QComboBox
+    cb_dis_ch:    QComboBox
+    cb_speed_ch:  QComboBox
+    cb_rate:      QComboBox
+    cb_save_time: QComboBox
+    # 文本输入
+    edit_target:  QLineEdit
+    # 按钮
+    btn_fit:      QPushButton
+    btn_zero:     QPushButton
+    btn_start:    QPushButton
+    btn_stop:     QPushButton
+    btn_refresh:  QPushButton
+    # 其它
+    lbl_fit_result: QLabel
+    progress:     QProgressBar
+    timer1:       QTimer
+    timer2:       QTimer
+
     def __init__(self):
+        """构造主窗口, 完成: 状态初始化 → DAQ/CSV/Plot 创建 → 信号槽连接 → UI 构建。
+
+        Args:
+            无
+
+        Returns:
+            无
+
+        Side Effects:
+            - 创建 DAQ 设备 (调用 create_daq_device 工厂)
+            - 创建 CSVLogger / PlotManager 空实例
+            - 创建 LoadHoldDetector (转速保载辨识) 并初始化 DIC 提示框/时延报告窗引用
+            - 连接 hold_entered_signal (QueuedConnection) 到 _show_hold_prompt
+            - 通过 build_main_ui(self) 构造所有 UI 控件并挂到 self
+            - 异步调度 _form_create 进行硬件初始化 (QTimer.singleShot(0))
+        """
         super().__init__()
-
-        # ---------- 路径 ----------
         self.exe_directory = os.path.dirname(os.path.abspath(sys.argv[0]))
-
-        # ---------- 内部状态(对应 private 字段) ----------
         self.is_first_overrun: bool = True
-
-        # 通道数据数组(0..7),对应 dataScaledArray1..8
         self.data_arrays = [np.zeros(0) for _ in range(8)]
-        # 原始拼合数据(交错格式)
-        self.data_scaled = np.zeros(0)
-
-        # 二维瀑布图缓存(110 时间槽 × N 频点)
-        self.data_sample_freq: Optional[np.ndarray] = None
-        # FFT 输入/输出缓冲
-        self.input1: Optional[np.ndarray] = None
-        self.output1: Optional[np.ndarray] = None
-        # 保存 FFT 结果(用于鼠标悬停展示)
-        self.fxy: Optional[np.ndarray] = None
-
-        # FFT 参数
-        self.N: int = 8192            # FFT 点数 = IntervalCount
-        self.Fs: int = 10000          # 采样率
-        self.T: float = 1.0 / 10000
-        self.D: float = 10000 / 8192  # 频率分辨率
-
-        # 主峰频率/相位/幅值
-        self.HzMax: float = 0.0
-        self.Phase: float = 0.0
-        self.HzMag: float = 0.0
-
-        # 文件
-        self.csv_file = None          # 数据 CSV 文件句柄
-        self.csv_path = ''
-        self.bmp_path = ''
         self.test_no = ''
+        self.bmp_path = ''
+        self._vib_png = ''
+        # 共享采集会话状态: 'idle' / 'running' / 'paused' (两页按钮的唯一状态源)
+        self.session_state = 'idle'
+        self.tick_count = time.time()
+        self.tick_count1 = time.time()
 
-        # 时钟
-        self.tick_count = time.time()      # 数据保存起点
-        self.tick_count1 = time.time()     # XY 曲线起点
-
-        # ---------- 数据采集设备 ----------
+        # 硬件设备 + 跨线程信号桥
         self.daq = create_daq_device()
         self.daq.set_on_data_ready(self._raise_data_ready)
         self.daq.set_on_overrun(self._on_overrun)
         self.daq.set_on_cache_overflow(self._on_cache_overflow)
-        # 跨线程把回调切回 Qt 主线程
+        # "采集卡断开"回调仅真卡 DaqDevice 提供 (模拟器无此方法, hasattr 守护)
+        if hasattr(self.daq, 'set_on_disconnect'):
+            self.daq.set_on_disconnect(self._raise_disconnect)
         self.data_ready_signal.connect(self._on_data_ready)
+        # 判定→弹窗: 队列连接, 即使同线程也延到下一轮事件循环 ("入队即返回, 不阻塞采集")
+        self.hold_entered_signal.connect(self._show_hold_prompt, Qt.QueuedConnection)
+        # 采集卡断开: 队列连接 (回调在轮询线程触发, 报警/停止须在 GUI 线程执行)
+        self.disconnect_signal.connect(self._on_disconnect)
 
-        # ---------- UI 构建 ----------
-        self._build_ui()
+        # 业务模块
+        self.csv = CSVLogger()
+        self.plot = PlotManager()
 
-        # ---------- 启动初始化(对应 FormCreate) ----------
+        # 转速保载辨识器: 任何转速保载都提示"可进行 DIC 采样";
+        # min_speed 仅作极小下限 (挡静止态 ≈0 RPM 并防除零), 真正在转的保载均会触发
+        self.hold_detector = LoadHoldDetector(min_speed=100.0)
+        # 当前 DIC 提示框引用 (非 None 表示有提示框未关闭)
+        self._dic_ready_box = None
+        # 单例时延报告窗 (惰性创建, 单次刷新复用)
+        self._latency_report = None
+        # 就绪窗口读数序号 k (软触发锚点用), 每帧自增
+        self._reading_index = 0
+        # 软触发状态量: 判定成立置位 (供后续 DIC 关联用, 当前仅置位不接业务)
+        self.dic_request_pending = False
+        # 采集卡在线状态 (设备在线监视用; _form_create 按启动检测初始化)
+        self._card_present = False
+        # 闩锁: 本次运行是否曾检测到真卡 —— 一旦为真, 本次运行不再使用模拟器
+        self._card_ever_seen = False
+        # 当前是否在用模拟器 (_form_create 按"无卡"初始化)
+        self._on_simulator = False
+
+        # UI 构建 (会把控件挂到 self.xxx)
+        build_main_ui(self)
+
+        # 把 ui_builder 创建的绘图控件注入 PlotManager
+        self.plot.attach(self.plotxy, self.scatter_xy, self.fit_curve)
+
+        # 硬件初始化推迟到事件循环启动后执行, 避免阻塞窗口显示
         QTimer.singleShot(0, self._form_create)
 
     # ============================================================
-    # UI 构建
+    # 菜单回调
     # ============================================================
-    def _build_ui(self):
-        self.setWindowTitle('涡轮超速预应力评估测试控制系统')
-        self.resize(1280, 820)
+    def _show_speed_fix_dialog(self):
+        """打开转速参数标定子窗口。
 
-        # ---------- 菜单 ----------
-        menubar = self.menuBar()
-        m_settings = menubar.addMenu('设置(&S)')
-        act_speed_fix = QAction('转速参数标定...', self)
-        act_speed_fix.triggered.connect(self._show_speed_fix_dialog)
-        m_settings.addAction(act_speed_fix)
+        Args:
+            无
 
-        m_file = menubar.addMenu('文件(&F)')
-        act_exit = QAction('退出(&X)', self)
-        act_exit.triggered.connect(self.close)
-        m_file.addAction(act_exit)
+        Returns:
+            无
 
-        # ---------- TabWidget(主页签 + 设置页签) ----------
-        self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
+        Side Effects:
+            - 弹出模态对话框; 用户确认后由 SpeedFixDialog 自行写盘和修改 g
+        """
+        dlg = SpeedFixDialog(self)
+        dlg.exec_()
 
-        # 主测试页
-        self.tab_main = QWidget()
-        self.tabs.addTab(self.tab_main, '实时测试')
-        self._build_main_tab()
+    def _show_about(self):
+        """弹出 '关于' 信息框 (静态文案, 无副作用)。
 
-        # 设置页
-        self.tab_setup = QWidget()
-        self.tabs.addTab(self.tab_setup, '采集参数')
-        self._build_setup_tab()
+        Args:
+            无
 
-        # 颜色页
-        self.tab_color = QWidget()
-        self.tabs.addTab(self.tab_color, '显示颜色')
-        self._build_color_tab()
+        Returns:
+            无
 
-        # ---------- 状态栏 ----------
-        self.statusBar().showMessage('就绪')
-
-    # ------------------------------------------------------------
-    def _build_main_tab(self):
-        """主测试页签 — 5 个图表 + 实时数据显示"""
-        layout = QVBoxLayout(self.tab_main)
-
-        # 顶部数值显示行
-        top = QHBoxLayout()
-        self.lbl_freq = self._make_indicator('主频 Hz', '0')
-        self.lbl_phase = self._make_indicator('相位 °', '0')
-        self.lbl_mag = self._make_indicator('频率幅值 μm', '0')
-        self.lbl_vib = self._make_indicator('峰峰值 μm', '0')
-        self.lbl_speed = self._make_indicator('实时转速 RPM', '0')
-        self.lbl_dis2 = self._make_indicator('当前位移 μm', '0')
-        self.lbl_left_df = self._make_indicator('残余偏差', '0')
-        for w in [self.lbl_freq, self.lbl_phase, self.lbl_mag,
-                  self.lbl_vib, self.lbl_speed, self.lbl_dis2, self.lbl_left_df]:
-            top.addWidget(w[0])   # 添加组合容器
-        layout.addLayout(top)
-
-        # 主体: 左右两栏
-        body = QHBoxLayout()
-
-        # ===== 左栏: 控制 + 频谱 =====
-        left = QVBoxLayout()
-
-        # 控制按钮
-        btn_box = QGroupBox('采集控制')
-        bg = QHBoxLayout(btn_box)
-        self.btn_start = QPushButton('开始(&S)')
-        self.btn_pause = QPushButton('暂停(&P)')
-        self.btn_stop = QPushButton('停止(&T)')
-        self.btn_save = QPushButton('手动保存数据')
-        self.btn_zero = QPushButton('归零(&0)')
-        self.btn_pause.setEnabled(False)
-        self.btn_stop.setEnabled(False)
-        self.btn_start.clicked.connect(self._btn_start_click)
-        self.btn_pause.clicked.connect(self._btn_pause_click)
-        self.btn_stop.clicked.connect(self._btn_stop_click)
-        self.btn_save.clicked.connect(self._btn_save_click)
-        self.btn_zero.clicked.connect(self._btn_zero_click)
-        bg.addWidget(self.btn_start)
-        bg.addWidget(self.btn_pause)
-        bg.addWidget(self.btn_stop)
-        bg.addWidget(self.btn_save)
-        bg.addWidget(self.btn_zero)
-        left.addWidget(btn_box)
-
-        # 频谱图(双 Y 轴: 幅值 + 相位)
-        grp_spec = QGroupBox('FFT 频谱(幅值 / 相位)')
-        gs = QVBoxLayout(grp_spec)
-        self.plot1 = pg.PlotWidget()
-        self.plot1.setLabel('left', '幅值', units='μm')
-        self.plot1.setLabel('bottom', '频率', units='Hz')
-        self.plot1.showGrid(x=True, y=True, alpha=0.3)
-        self.curve_mag = self.plot1.plot([], [], pen=pg.mkPen('#1f77b4', width=2), name='幅值')
-        # 右 Y 轴 (相位)
-        self.plot1_p2 = pg.ViewBox()
-        self.plot1.scene().addItem(self.plot1_p2)
-        self.plot1.getAxis('right').linkToView(self.plot1_p2)
-        self.plot1_p2.setXLink(self.plot1)
-        self.plot1.showAxis('right')
-        self.plot1.getAxis('right').setLabel('相位', units='°')
-        self.curve_phase = pg.PlotCurveItem([], [], pen=pg.mkPen('#d62728', width=1, style=Qt.DashLine))
-        self.plot1_p2.addItem(self.curve_phase)
-        self.plot1.getViewBox().sigResized.connect(self._update_p2_geometry)
-        gs.addWidget(self.plot1)
-        left.addWidget(grp_spec, 1)
-
-        body.addLayout(left, 1)
-
-        # ===== 右栏: 振动趋势 + 瀑布即时谱 + XY 变形 =====
-        right = QVBoxLayout()
-
-        # 振动幅值随时间趋势 (iPlot2)
-        grp_trend = QGroupBox('振动峰峰值 vs 时间')
-        gt = QVBoxLayout(grp_trend)
-        self.plot2 = pg.PlotWidget()
-        self.plot2.setLabel('left', '振动幅值', units='μm')
-        self.plot2.setLabel('bottom', '时间', units='s')
-        self.plot2.showGrid(x=True, y=True, alpha=0.3)
-        self.curve_trend = self.plot2.plot([], [], pen=pg.mkPen('#2ca02c', width=2))
-        # 鼠标悬停取频谱
-        self.plot2.scene().sigMouseMoved.connect(self._on_plot2_hover)
-        gt.addWidget(self.plot2)
-        right.addWidget(grp_trend, 1)
-
-        # 即时频谱(瀑布图回放) (iPlot3)
-        grp_inst = QGroupBox('即时频谱(鼠标悬停在上图取回放)')
-        gi = QVBoxLayout(grp_inst)
-        self.plot3 = pg.PlotWidget()
-        self.plot3.setLabel('left', '幅值', units='μm')
-        self.plot3.setLabel('bottom', '频率', units='Hz')
-        self.plot3.showGrid(x=True, y=True, alpha=0.3)
-        self.curve_inst = self.plot3.plot([], [], pen=pg.mkPen('#ff7f0e', width=2))
-        gi.addWidget(self.plot3)
-        right.addWidget(grp_inst, 1)
-
-        # XY 变形 - 转速²拟合图 (iXYPlot1)
-        grp_xy = QGroupBox('变形量 vs 转速²/10⁶ (线性拟合预应力)')
-        gx = QVBoxLayout(grp_xy)
-        self.plotxy = pg.PlotWidget()
-        self.plotxy.setLabel('left', '变形量', units='μm')
-        self.plotxy.setLabel('bottom', '转速²/10⁶', units='RPM²')
-        self.plotxy.showGrid(x=True, y=True, alpha=0.3)
-        self.scatter_xy = pg.ScatterPlotItem(size=4, brush=pg.mkBrush('#9467bd'), pen=None)
-        self.plotxy.addItem(self.scatter_xy)
-        self.curve_fit = self.plotxy.plot([], [], pen=pg.mkPen('r', width=2))
-        gx.addWidget(self.plotxy)
-
-        # 拟合参数 + 拟合按钮
-        fit_row = QHBoxLayout()
-        fit_row.addWidget(QLabel('Rpm1:'))
-        self.edit_rpm1 = QLineEdit('40')
-        self.edit_rpm1.setMaximumWidth(80)
-        self.edit_rpm1.textChanged.connect(self._on_edit3_change)
-        fit_row.addWidget(self.edit_rpm1)
-        fit_row.addWidget(QLabel('Rpm2:'))
-        self.edit_rpm2 = QLineEdit('60')
-        self.edit_rpm2.setMaximumWidth(80)
-        self.edit_rpm2.textChanged.connect(self._on_edit4_change)
-        fit_row.addWidget(self.edit_rpm2)
-        fit_row.addWidget(QLabel('Fxa:'))
-        self.edit_fxa = QLineEdit('10')
-        self.edit_fxa.setMaximumWidth(80)
-        self.edit_fxa.textChanged.connect(self._on_edit1_change)
-        fit_row.addWidget(self.edit_fxa)
-        fit_row.addWidget(QLabel('Fxb:'))
-        self.edit_fxb = QLineEdit('0')
-        self.edit_fxb.setMaximumWidth(80)
-        self.edit_fxb.textChanged.connect(self._on_edit2_change)
-        fit_row.addWidget(self.edit_fxb)
-        self.btn_fit = QPushButton('自动拟合')
-        self.btn_fit.clicked.connect(self._btn_fit_click)
-        fit_row.addWidget(self.btn_fit)
-        self.btn_redraw_fit = QPushButton('重绘拟合线')
-        self.btn_redraw_fit.clicked.connect(self._btn_redraw_fit_click)
-        fit_row.addWidget(self.btn_redraw_fit)
-        gx.addLayout(fit_row)
-
-        # 进度条 + 导出按钮
-        bottom_row = QHBoxLayout()
-        bottom_row.addWidget(QLabel('保存进度:'))
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        bottom_row.addWidget(self.progress)
-        self.btn_export_waterfall = QPushButton('导出瀑布图CSV')
-        self.btn_export_waterfall.clicked.connect(self._btn_export_waterfall_click)
-        bottom_row.addWidget(self.btn_export_waterfall)
-        gx.addLayout(bottom_row)
-
-        right.addWidget(grp_xy, 1)
-
-        body.addLayout(right, 1)
-
-        layout.addLayout(body, 1)
-
-        # ---------- 启动用的子定时器 ----------
-        # Timer2: 每 200ms 绘制 XY 变形点(对应原 Timer2)
-        self.timer2 = QTimer(self)
-        self.timer2.setInterval(200)
-        self.timer2.timeout.connect(self._on_timer2)
-
-        # Timer1: 保存完成提示
-        self.timer1 = QTimer(self)
-        self.timer1.setSingleShot(True)
-        self.timer1.setInterval(100)
-        self.timer1.timeout.connect(self._on_timer1)
-
-        # Timer4: 启动后延时创建数据文件
-        self.timer4 = QTimer(self)
-        self.timer4.setSingleShot(True)
-        self.timer4.setInterval(500)
-        self.timer4.timeout.connect(self._on_timer4)
-
-    # ------------------------------------------------------------
-    def _build_setup_tab(self):
-        """采集参数页签"""
-        outer = QVBoxLayout(self.tab_setup)
-
-        # ===== 采集参数 =====
-        grp_acq = QGroupBox('数据采集参数')
-        f = QFormLayout(grp_acq)
-        self.cb_ch_start = QComboBox()
-        self.cb_ch_start.addItems([str(i) for i in range(16)])
-        self.cb_ch_start.currentIndexChanged.connect(self._on_cb3_change)
-        f.addRow('起始通道:', self.cb_ch_start)
-
-        self.cb_ch_count = QComboBox()
-        self.cb_ch_count.addItems(['1', '2', '4', '8', '16'])
-        self.cb_ch_count.setCurrentText('8')
-        self.cb_ch_count.currentTextChanged.connect(self._on_cb4_change)
-        f.addRow('扫描通道数:', self.cb_ch_count)
-
-        self.cb_rate = QComboBox()
-        self.cb_rate.addItems(['1000', '5000', '10000', '20000', '50000', '100000', '200000'])
-        self.cb_rate.setCurrentText('10000')
-        self.cb_rate.currentTextChanged.connect(self._on_cb5_change)
-        f.addRow('采样率 (Hz):', self.cb_rate)
-
-        self.cb_samples = QComboBox()
-        self.cb_samples.addItems(['1024', '2048', '4096', '8192', '16384'])
-        self.cb_samples.setCurrentText('8192')
-        self.cb_samples.currentTextChanged.connect(self._on_cb6_change)
-        f.addRow('每次采样点数:', self.cb_samples)
-
-        # 振动通道(FreqCH) + 转速通道
-        self.cb_freq_ch = QComboBox()
-        self.cb_freq_ch.addItems([f'通道{i}' for i in range(16)])
-        self.cb_freq_ch.setCurrentIndex(0)
-        f.addRow('振动信号通道:', self.cb_freq_ch)
-
-        self.cb_speed_ch = QComboBox()
-        self.cb_speed_ch.addItems([f'通道{i}' for i in range(16)])
-        self.cb_speed_ch.setCurrentIndex(7)
-        f.addRow('转速信号通道:', self.cb_speed_ch)
-
-        outer.addWidget(grp_acq)
-
-        # ===== 信号处理参数 =====
-        grp_sig = QGroupBox('信号处理')
-        f2 = QFormLayout(grp_sig)
-        self.cb_low_stop = QComboBox()
-        self.cb_low_stop.setEditable(True)
-        self.cb_low_stop.addItems(['1', '2', '5', '10', '20'])
-        self.cb_low_stop.setCurrentText('2')
-        self.cb_low_stop.currentTextChanged.connect(self._on_cb7_change)
-        f2.addRow('低频截止 (Hz):', self.cb_low_stop)
-
-        self.cb_high_stop = QComboBox()
-        self.cb_high_stop.setEditable(True)
-        self.cb_high_stop.addItems(['200', '500', '1000', '2000', '5000'])
-        self.cb_high_stop.setCurrentText('1000')
-        self.cb_high_stop.currentTextChanged.connect(self._on_cb10_change)
-        f2.addRow('高频截止 (Hz):', self.cb_high_stop)
-
-        self.cb_sens = QComboBox()
-        self.cb_sens.addItems([
-            '加速度计(8 mV/(m/s²))',
-            '通用 1 mV/V',
-            '电荷放大器(4.78)',
-            '加速度计(0.5)',
-            '通用 1.0',
-            '电涡流位移(1.8 mV/μm)',
-        ])
-        self.cb_sens.setCurrentIndex(5)
-        self.cb_sens.currentIndexChanged.connect(self._on_cb9_change)
-        f2.addRow('传感器灵敏度:', self.cb_sens)
-
-        outer.addWidget(grp_sig)
-
-        # ===== 保存参数 =====
-        grp_save = QGroupBox('保存设置')
-        f3 = QFormLayout(grp_save)
-        self.cb_save_time = QComboBox()
-        self.cb_save_time.setEditable(True)
-        self.cb_save_time.addItems(['10', '30', '60', '120', '300', '600'])
-        self.cb_save_time.setCurrentText('60')
-        self.cb_save_time.currentTextChanged.connect(self._on_cb8_change)
-        f3.addRow('采集时长 (秒):', self.cb_save_time)
-
-        self.cb_step = QComboBox()
-        self.cb_step.addItems(['2', '3', '4', '5'])
-        self.cb_step.setCurrentIndex(0)
-        self.cb_step.currentIndexChanged.connect(self._on_step_change)
-        f3.addRow('瀑布步长 (秒):', self.cb_step)
-
-        outer.addWidget(grp_save)
-        outer.addStretch()
-
-    # ------------------------------------------------------------
-    def _build_color_tab(self):
-        """颜色设置页签"""
-        outer = QVBoxLayout(self.tab_color)
-        outer.addWidget(QLabel('(此页签用于自定义曲线颜色,功能与原版等价,'
-                                '简化版默认使用预定义配色。)'))
-        outer.addStretch()
-
-    # ------------------------------------------------------------
-    def _make_indicator(self, label_text: str, init_value: str):
-        """构造数值指示器组件(标签+大字数值)"""
-        gb = QGroupBox(label_text)
-        v = QVBoxLayout(gb)
-        v.setContentsMargins(8, 12, 8, 8)
-        lbl = QLabel(init_value)
-        lbl.setAlignment(Qt.AlignCenter)
-        lbl.setStyleSheet('font-size: 24px; font-weight: bold; color: #1f77b4;')
-        v.addWidget(lbl)
-        return (gb, lbl)
-
-    def _update_p2_geometry(self):
-        """同步频谱右 Y 轴(相位)的几何位置"""
-        self.plot1_p2.setGeometry(self.plot1.getViewBox().sceneBoundingRect())
-        self.plot1_p2.linkedViewChanged(self.plot1.getViewBox(), self.plot1_p2.XAxis)
+        Side Effects:
+            - 弹出模态 QMessageBox
+        """
+        QMessageBox.about(
+            self, "关于",
+            "HRSTD 在线变形测量系统\n"
+            "浙江大学高速旋转机械实验室\n"
+            "传感器配置: 激光测距仪 LK-H080"
+        )
 
     # ============================================================
-    # FormCreate —— 启动初始化
+    # 启动初始化 (异步, 由 __init__ 末尾的 singleShot 触发)
     # ============================================================
     def _form_create(self):
-        try:
-            # ---- 1) 读取 DeviceSet.txt ----
-            path = os.path.join(self.exe_directory, 'Sysdata', 'DeviceSet.txt')
-            if not os.path.exists(path):
-                # 找不到时使用默认值
-                self.statusBar().showMessage(f'未找到 {path}, 使用默认参数')
-                device_number = 0
-                g.VoltageIni = 1.0
-                g.VoltageMax = 5.0
-                g.SpeedMax = 60000.0
-                g.SpeedfixNum = 0.0
-            else:
-                with open(path, 'r', encoding='utf-8') as f:
-                    lines = [ln.strip() for ln in f.readlines() if ln.strip()]
-                device_number = int(lines[0])
-                g.VoltageIni = float(lines[1])
-                g.VoltageMax = float(lines[2])
-                g.SpeedMax = float(lines[3])
-                g.SpeedfixNum = float(lines[4])
+        """启动时检测真卡 → 配置 DAQ → 初始化数据缓冲 → 准备硬件。
 
-            # ---- 2) 配置 DAQ 设备 ----
-            self.daq.select_device(device_number)
+        Args:
+            无
+
+        Returns:
+            无
+
+        Side Effects:
+            - 调用 find_real_device() 枚举安装设备检测真卡 (排除 DemoDevice)
+            - 有真卡: 按检测到的设备号 select_device, 不提示
+            - 无真卡: _rebind_device 切换到模拟器, 配置完成后弹窗"未接入采集卡"
+            - 调用 load_device_set() 读取 DeviceSet.txt
+            - 配置 DAQ 设备 (通道 / 采样率 / signal_type / value_range)
+            - 修改窗口标题 / g.Savetime / g.Sensitivity1 / g.TransPara1
+            - 重新分配 self.data_arrays; 调用 self.daq.prepare()
+            - 真卡打开/配置失败时弹 QMessageBox.critical 并 return
+
+        行为不变量:
+            - 真卡设备号由 find_real_device 自动选取首个非 Demo 设备 (不再写死 0,
+              因 DAQNavi 的 0 号常为 DemoDevice)
+            - 通道范围 [0, 8); samples=16384; interval_count=8192
+            - signal_type=1 (Differential); value_range=1 (±10 V)
+            - per_ch = max(1, buf_cap // (ch_count * 2))
+        """
+        # 启动检测真卡: 枚举安装设备并排除 DemoDevice; 有真卡用真卡, 否则换自带模拟器。
+        real = find_real_device()        # (设备号, 描述) 或 None
+        no_card = real is None
+        self._card_present = not no_card             # 记录初始在线状态 (供监视器)
+        self._on_simulator = no_card                 # 无卡才用模拟器
+        if not no_card:
+            self._card_ever_seen = True              # 启动即见到真卡 → 置闩锁
+        if no_card:
+            self._rebind_device(create_daq_device(force_simulate=True))
+        # 启动"设备在线监视": 空闲时每 0.5s 轻量枚举, 检测采集卡断开/重连
+        if not hasattr(self, 'monitor_timer'):
+            self.monitor_timer = QTimer(self)
+            self.monitor_timer.setInterval(500)
+            self.monitor_timer.timeout.connect(self._monitor_devices)
+        self.monitor_timer.start()
+        try:
+            device_number = load_device_set()          # 读 DeviceSet.txt
+            if no_card:
+                self.daq.select_device(device_number)   # 模拟器: 仅设描述, 无副作用
+            else:
+                self.daq.select_device(real[0])         # 真卡: 用检测到的设备号(已排除 Demo)
             self.daq.channel_start = 0
             self.daq.channel_count = 8
-            self.daq.sample_rate = 10000.0
+            self.daq.sample_rate = float(self.cb_rate.currentText())
             self.daq.samples = 16384
             self.daq.interval_count = 8192
             self.daq.configure_channels(signal_type=1, value_range=1)
             self.daq.configure_scan()
 
-            # 更新标题
-            self.setWindowTitle(
-                f'涡轮超速预应力评估测试控制系统 - {self.daq.device_description}'
-            )
+            self.setWindowTitle(f'HRSTD 在线变形测量系统 - {self.daq.device_description}')
 
-            # ---- 3) 全局参数初始化 ----
-            g.Vib1 = g.Vib2 = g.Vib3 = g.Vib4 = 0.0
-            g.Vib5 = g.Vib6 = g.Vib7 = g.Vib8 = 0.0
-            g.Rpm1 = 40.0
-            g.Rpm2 = 60.0
-            g.Savetime = float(self.cb_save_time.currentText() or 60)
-            g.Deformation0 = 0.0
-            g.Dis0 = 0.0
-            g.Dis1 = 0.0
-            g.Fxa = 10.0
-            g.Fxb = 0.0
-            for i in range(20):
-                g.SumS2[i] = 1.0
-                g.SumS1[i] = 0.0
-                g.SumD2[i] = 10.0
-                g.SumD1[i] = 0.0
+            g.Savetime = float(self.cb_save_time.currentText())
             g.Sensitivity1 = 1.0 / 1.8
-            g.steptime = 2
             g.TransPara1 = 1000.0 / g.Sensitivity1
 
-            # 默认带阻
-            g.StopFreqLow = int(self.cb_low_stop.currentText() or 2)
-            g.StopFreqHigh = int(self.cb_high_stop.currentText() or 1000)
-
-            # ---- 4) 分配数据缓冲 ----
             buf_cap = self.daq.buffer_capacity
             per_ch = max(1, buf_cap // (self.daq.channel_count * 2))
             self.data_arrays = [np.zeros(per_ch) for _ in range(8)]
 
-            # ---- 5) 准备硬件 ----
             self.is_first_overrun = True
             self.daq.prepare()
-            self.data_scaled = np.zeros(max(buf_cap, self.daq.interval_count * self.daq.channel_count))
-
-            # 状态栏
-            mode_str = '真实硬件' if DAQNAVI_AVAILABLE and not self.daq.device_description.startswith('Sim') else '模拟模式'
-            self.statusBar().showMessage(f'初始化完成 - {mode_str}')
 
         except Exception as e:
-            QMessageBox.critical(
-                self, '硬件错误',
-                f'硬件错误,请确认匹配的采集卡连接!\n\n详细: {e}'
+            QMessageBox.critical(self, '硬件错误', f'请确认匹配的采集卡连接!\n\n详细: {e}')
+            return
+
+        # 无真卡: 已切到模拟器, 弹窗告知 (有真卡则不提示)
+        if no_card:
+            QMessageBox.information(
+                self, '未接入采集卡',
+                '未检测到 USB-4716 采集卡，已切换到模拟器运行。\n'
+                '（数据为模拟生成，仅供调试 / 演示）'
             )
-            # 原 Delphi 用 Timer3 延时关闭,这里 3 秒后退出
-            QTimer.singleShot(3000, self.close)
+
+    def _rebind_device(self, new_dev):
+        """把 self.daq 换成 new_dev 并重新绑定数据/告警回调。
+
+        Args:
+            new_dev: 新的 DaqDeviceBase 实例 (此处为回退用的 SimulatedDaqDevice)
+
+        Returns:
+            无
+
+        Side Effects:
+            - self.daq = new_dev; 重新 set_on_data_ready / overrun / cache_overflow
+
+        说明:
+            用于启动检测到无真卡时, 把 __init__ 里建好的真卡设备替换为模拟器;
+            回调与 __init__ 中的绑定一致, data_ready_signal 等信号槽无需重连。
+        """
+        self.daq = new_dev
+        self.daq.set_on_data_ready(self._raise_data_ready)
+        self.daq.set_on_overrun(self._on_overrun)
+        self.daq.set_on_cache_overflow(self._on_cache_overflow)
 
     # ============================================================
     # 按钮事件
     # ============================================================
     def _btn_start_click(self):
-        """对应 BtnStartClick"""
+        """[径向页-开始采集] 按钮: 转发到共享会话 start_session('radial')。"""
+        self.start_session('radial')
+
+    def start_session(self, initiator: str = 'radial'):
+        """共享采集会话入口: 两页的"开始采集"都汇聚到此 (需求: 共享一次采集)。
+
+        Args:
+            initiator: 'radial' (径向页发起) 或 'vib' (振动页发起);
+                       采样率/分析点数以发起方页面的设置为准
+
+        Returns:
+            无
+
+        Side Effects:
+            - 上一会话处于暂停态时先 _finalize_paused_quietly() 静默收尾旧档
+            - 按发起方应用 daq.sample_rate (振动页发起时还应用 interval_count
+              = 分析点数 N, samples = 2N), 并 configure_scan() 下发到硬件
+            - 复位两页绘图 (plot.reset_for_new_run / vib_tab 在 begin_session 内复位)
+            - 重置 g.DataSaveFlag、is_first_overrun、hold_detector、DIC 保载序列
+            - 重新分配 self.data_arrays (每通道 interval_count 大小)
+            - make_dated_folder() 创建一个共用试验目录; 打开径向 5 列 CSV
+              与振动 6 列 CSV (vib_tab.begin_session)
+            - 启动 timer2; 重置 tick_count(1); daq.prepare()+start()
+            - session_state='running' 并统一刷新两页按钮
+            - 失败时弹 QMessageBox.critical
+        """
+        # 闩锁: 本次运行已检测到真卡且当前在用模拟器 → 模拟器已停用, 拒绝启动并提示重启
+        if self._on_simulator and self._card_ever_seen:
+            QMessageBox.warning(
+                self, '模拟器已停用',
+                '本次运行已检测到采集卡，模拟器已停用。\n'
+                '请重启程序：接好采集卡启动用真卡，或断开采集卡启动用模拟器。'
+            )
+            return
         try:
-            # 清空 XY 图
-            self.scatter_xy.clear()
-            self.curve_fit.setData([], [])
-            self.plotxy.setXRange(0, 130)
-            self.plotxy.setYRange(0, 3000)
+            # 暂停态直接再开始 = 静默收尾旧档 + 新建档案 (对应 Delphi 暂停→开始语义)
+            if self.session_state == 'paused':
+                self._finalize_paused_quietly()
 
-            g.SumCount1 = 0
-            g.SumCount2 = 0
+            # 采集参数以发起方为准 (用户可能临时改了下拉框)
+            try:
+                if initiator == 'vib':
+                    self.daq.sample_rate = self.vib_tab.preferred_rate()
+                    n = self.vib_tab.preferred_interval()
+                    self.daq.interval_count = n
+                    self.daq.samples = n * 2
+                else:
+                    self.daq.sample_rate = float(self.cb_rate.currentText())
+                self.daq.configure_scan()   # 下发到硬件 (模拟器为空操作)
+            except Exception:
+                pass
+
+            self.plot.reset_for_new_run()
+
             g.DataSaveFlag = False
-
             self.is_first_overrun = True
+            self.hold_detector.reset()   # 新采集复位保载辨识, 重新从调速态开始
+            self._reading_index = 0
+            self.dic_request_pending = False
+            self.dic_tab.clear_hold_speeds()   # 新采集清空上一轮保载转速序列 (只留最近一轮)
 
-            # 按 IntervalCount 重新设缓冲大小
             ic = self.daq.interval_count
             self.data_arrays = [np.zeros(ic) for _ in range(8)]
 
-            # 初始化 FFT 参数
-            self.N = self.daq.interval_count
-            self.Fs = int(self.daq.sample_rate)
-            self.T = 1.0 / self.Fs
-            self.D = 1.0 / (self.N * self.T)
+            # 创建当日数据目录, 同时取得 test_no (作为两页 CSV / PNG 文件名前缀)
+            full, test_no = make_dated_folder(self.exe_directory)
+            g.Filestrtemp = full
+            self.test_no = test_no
+            self._vib_png = ''
 
-            # 初始化瀑布图缓存
-            self.data_sample_freq = np.zeros((110, self.N))
-            g.Freqenable = True
+            # 打开径向 CSV (与原版字节一致) + 振动页 CSV (6 列, <编号>_vib.CSV)
+            self.csv.open(full, test_no, int(self.daq.sample_rate), int(g.Savetime))
+            self.vib_tab.begin_session(full, test_no, float(self.daq.sample_rate))
 
-            # 拟合系数复位
-            g.Fxa = 10.0
-            g.Fxb = 0.0
+            g.DataSaveFlag = True
 
-            # 启动定时器
             self.timer2.start()
-
             self.tick_count1 = time.time()
+            self.tick_count = time.time()
 
-            # 准备 + 启动采集
             self.daq.prepare()
-            self.data_scaled = np.zeros(self.daq.samples * 8)
-
-            # 延时创建数据文件
-            self.timer4.start()
-
-            # 启动硬件采集
             self.daq.start()
 
-            # UI 状态
-            self.btn_start.setEnabled(False)
-            self.btn_pause.setEnabled(True)
-            self.btn_stop.setEnabled(True)
-
-            self.statusBar().showMessage('采集进行中...')
-
+            self.session_state = 'running'
+            self._apply_run_state()
+            src = '（振动页发起）' if initiator == 'vib' else ''
+            self.statusBar().showMessage(f'采集进行中...{src}')
         except Exception as e:
             QMessageBox.critical(self, '启动失败', str(e))
 
-    def _btn_pause_click(self):
+    def pause_session(self):
+        """暂停共享会话 (对应 Delphi BtnPause): 停硬件流, 两页文件保持打开。
+
+        Args:
+            无
+
+        Returns:
+            无
+
+        Side Effects:
+            - 仅 running 态生效: daq.stop(); timer2 停; session_state='paused'
+            - 两份 CSV 不关闭 (无帧到来自然停写); 其后"开始采集"将新建档案
+            - 停止硬件失败时弹窗并维持原状态
+        """
+        if self.session_state != 'running':
+            return
         try:
             self.daq.stop()
-            self.btn_start.setEnabled(True)
-            self.btn_pause.setEnabled(False)
-            self.statusBar().showMessage('已暂停')
         except Exception as e:
             QMessageBox.critical(self, '暂停失败', str(e))
+            return
+        self.timer2.stop()
+        self.session_state = 'paused'
+        self._apply_run_state()
+        self.statusBar().showMessage(
+            '采集已暂停（文件保持打开；再按"开始采集"将新建档案）')
+
+    def _finalize_paused_quietly(self):
+        """暂停态直接开新会话前的旧档收尾: 关两份 CSV, 不弹窗不截图。
+
+        Side Effects:
+            - g.DataSaveFlag=False; 径向/振动 CSV close (幂等);
+              session_state='idle' (旧档数据已完整落盘, 可直接开新档)
+        """
+        g.DataSaveFlag = False
+        self.csv.close()
+        self.vib_tab.close_csv()
+        self.session_state = 'idle'
+
+    def _apply_run_state(self):
+        """按 session_state 统一刷新两页按钮使能 (共享会话的唯一状态源)。
+
+        Side Effects:
+            - 径向页: 开始 (非 running 可按) / 停止 (running 或 paused) /
+              刷新 (仅 idle); 振动页经 vib_tab.set_run_state 同步
+        """
+        st = self.session_state
+        running = st == 'running'
+        paused = st == 'paused'
+        self.btn_start.setEnabled(not running)
+        self.btn_stop.setEnabled(running or paused)
+        self.btn_refresh.setEnabled(st == 'idle')
+        self.vib_tab.set_run_state(st)
 
     def _btn_stop_click(self):
-        """对应 BtnStopClick"""
+        """[径向页-停止采集] 按钮: 转发到共享会话 stop_session()。"""
+        self.stop_session()
+
+    def stop_session(self):
+        """结束共享会话: 停 DAQ → 两页各出 PNG → 关振动 CSV → 延时关径向 CSV。
+
+        Args:
+            无
+
+        Returns:
+            无
+
+        Side Effects:
+            - 仅 running/paused 态生效; 设置 g.DataSaveFlag = False
+            - 启动 self.timer1 (100ms 后 _on_timer1 关径向 CSV 并弹"保存数据成功")
+            - 径向散点图 PNG (plot.export_png) 与振动频谱 PNG + 振动 CSV 关闭
+              (vib_tab.end_session); 截图失败仅打印 [WARN]
+            - 调用 self.daq.stop(); 停 timer2; session_state='idle' 并刷新两页按钮
+
+        行为不变量 (与重构前 _btn_stop_click 一致):
+            - 即使截图失败, CSV 和 DAQ 仍然要正确停止
+            - DAQ.stop() 失败才弹 QMessageBox.critical
+        """
+        if self.session_state == 'idle':
+            return
         try:
             g.DataSaveFlag = False
-            self.timer1.start()    # 触发"保存成功"提示
+            self.timer1.start()
 
-            # 保存 XY 图截图
+            # 导出径向散点图 PNG (失败仅警告, 不影响后续流程)
             try:
-                exporter = pg.exporters.ImageExporter(self.plotxy.plotItem)
-                if g.Filestrtemp and g.TestNoTemp:
-                    bmp = os.path.join(g.Filestrtemp, f'{g.TestNoTemp}.png')
-                    exporter.export(bmp)
-                    self.bmp_path = bmp
+                if g.Filestrtemp and self.test_no:
+                    self.bmp_path = self.plot.export_png(g.Filestrtemp, self.test_no)
             except Exception as ex:
                 print(f'[WARN] 截图保存失败: {ex}')
 
+            # 振动页收尾: 频谱 PNG 快照 + 关闭 6 列 CSV (内部自行吞截图异常)
+            self._vib_png = self.vib_tab.end_session(export_png=True)
+
             self.daq.stop()
-
-            self.btn_start.setEnabled(True)
-            self.btn_pause.setEnabled(False)
-            self.btn_stop.setEnabled(False)
-
-            # 清理缓冲
-            for i in range(8):
-                self.data_arrays[i] = np.zeros(0)
-
             self.timer2.stop()
-            self.data_scaled = np.zeros(0)
-
+            self.session_state = 'idle'
+            self._apply_run_state()
             self.statusBar().showMessage('采集已停止')
 
         except Exception as e:
             QMessageBox.critical(self, '停止失败', str(e))
 
-    def _btn_save_click(self):
-        """对应 BtnSaveClick — 手动创建一个新的数据文件"""
-        try:
-            now = datetime.now()
-            date_str = now.strftime('%Y%m%d')
-            base = os.path.join(self.exe_directory, 'data')
-            i = 1
-            s1 = '01'
-            sub = f'{date_str}{s1}'
-            full = os.path.join(base, sub)
-            while os.path.exists(full):
-                i += 1
-                s1 = f'{i:02d}'
-                sub = f'{date_str}{s1}'
-                full = os.path.join(base, sub)
-            os.makedirs(full, exist_ok=True)
-            self.test_no = f'{date_str}{s1}'
-            self.csv_path = os.path.join(full, f'{self.test_no}.CSV')
-            self.csv_file = open(self.csv_path, 'w', encoding='utf-8')
-            self.csv_file.write(f'{self.cb_freq_ch.currentText()}\n')
-            self.csv_file.write(f'采样频率: {self.daq.sample_rate}\n')
-            self.csv_file.write(f'采集时长: {self.cb_save_time.currentText()}s\n')
-            self.csv_file.write('时间 初始位移 当前位移 变形量 振动幅值 转速\n')
-            g.DataSaveFlag = True
-            self.tick_count = time.time()
-            self.statusBar().showMessage(f'保存中: {self.csv_path}')
-        except Exception as e:
-            QMessageBox.critical(self, '保存失败', str(e))
-
     def _btn_zero_click(self):
-        """对应 Button1Click — 把当前位移定为零点"""
-        try:
-            g.Dis0 = g.Dis2
-            self.btn_zero.setEnabled(False)
-            self.statusBar().showMessage(f'已归零, Dis0 = {g.Dis0:.2f}')
-        except Exception:
-            QMessageBox.warning(self, '失败', '归零失败,请重启动后重试')
+        """[位置归零] 按钮: 把当前间距 Dis2 设为零点 Dis0。
+
+        Args:
+            无
+
+        Returns:
+            无
+
+        Side Effects:
+            - g.Dis0 = g.Dis2
+            - 弹出归零成功的提示框
+
+        行为不变量 (与原 main_app.py:450-452 一致):
+            - 弹窗文案 '当前位置已设定为零点\\nDis0 = X.XX μm' 保留 2 位小数
+        """
+        g.Dis0 = g.Dis2
+        QMessageBox.information(
+            self, '归零成功',
+            f'当前位置已设定为零点\nDis0 = {g.Dis0:.2f} μm'
+        )
+
+    def _btn_refresh_click(self):
+        """[刷新] 按钮: 清空已采集的显示数据, 但不删除任何已保存的 CSV 文件。
+
+        Args:
+            无
+
+        Returns:
+            无
+
+        Side Effects:
+            - self.plot.reset_for_new_run(): 清空散点 + 复位坐标范围
+            - 4 个指标 Label (转速/间距/变形量/完成率) 复位为 '0'
+            - 进度条 self.progress 归零
+            - 状态栏提示
+            - **不触碰磁盘上的 CSV 文件**, 不停止/启动采集, 不改 Dis0
+
+        行为约束:
+            - 仅在未采集时可用 (采集进行中本按钮由 _btn_start_click 禁用,
+              _btn_stop_click 恢复), 避免边采边清。
+        """
+        self.plot.reset_for_new_run()
+        self.lbl_speed[1].setText('0')
+        self.lbl_dis2[1].setText('0')
+        self.lbl_def[1].setText('0')
+        self.lbl_rate[1].setText('0')
+        self.progress.setValue(0)
+        self.statusBar().showMessage('已清空采集显示数据（已保存的 CSV 文件不受影响）')
 
     def _btn_fit_click(self):
-        """对应 Button2Click — 对 20 个采样点做最小二乘拟合"""
-        try:
-            y1 = sum(g.SumD1[:20]) / 20.0
-            y2 = sum(g.SumD2[:20]) / 20.0
-            x1 = sum(g.SumS1[:20]) / 20.0
-            x2 = sum(g.SumS2[:20]) / 20.0
-            if abs(x2 - x1) < 1e-9:
-                QMessageBox.warning(self, '拟合失败', '两个参考点过于接近,无法拟合')
-                return
-            g.Fxa = (y2 - y1) / (x2 - x1)
-            g.Fxb = y1 - g.Fxa * x1
-            self.edit_fxa.setText(f'{g.Fxa:.1f}')
-            self.edit_fxb.setText(f'{g.Fxb:.1f}')
-            self._draw_fit_line()
-        except Exception as e:
-            QMessageBox.warning(self, '拟合失败', str(e))
+        """[开始拟合] 按钮: 用分段幂函数拟合当前采集的 转速-变形 数据并绘曲线。
 
-    def _btn_redraw_fit_click(self):
-        """对应 Button3Click"""
-        self._draw_fit_line()
+        Args:
+            无
 
-    def _draw_fit_line(self):
-        x_max = self.plotxy.viewRange()[0][1]
-        if x_max <= 0:
-            x_max = 130
-        xs = np.array([0, x_max])
-        ys = g.Fxa * xs + g.Fxb
-        self.curve_fit.setData(xs, ys)
+        Returns:
+            无
 
-    def _btn_export_waterfall_click(self):
-        """对应 bsSkinButton1Click — 导出瀑布图 CSV"""
-        if not g.Freqenable or self.data_sample_freq is None:
-            QMessageBox.information(self, '提示', '先启动振动采集才有数据可导出')
+        Side Effects:
+            - 从 self.plot.get_points() 取累加的 (转速, 变形) 点
+            - 调用 data_processor.fit_piecewise_power 做两段幂函数最小二乘拟合
+            - 成功: self.plot.draw_fit_curve 在右图画拟合曲线, 并把拟合函数 (变形用
+              斜体 δ、转速用斜体 N) 与确定系数 R² 写入 self.lbl_fit_result
+            - 成功且本次采集已存 CSV 时: 调用 self.csv.append_fit 把拟合函数追加到
+              该 CSV 末尾 (不影响已存的采集数据)
+            - 失败/数据不足: 清空拟合曲线, 在 lbl_fit_result 红字显示原因
+            - 全程不弹窗, 结果就地显示在"变形拟合及目标设定"栏
+
+        说明:
+            分段幂函数 y=a·x^b 两段、自动搜索断点、各段独立最小二乘 (scipy.curve_fit),
+            仅用 x>0 且 y>0 的点。
+        """
+        xs, ys = self.plot.get_points()
+        if len(xs) < 8:
+            self.plot.clear_fit_curve()
+            self.lbl_fit_result.setText(
+                f'<span style="color:#c0392b;">数据点不足（{len(xs)}），'
+                f'请先采集后再拟合。</span>')
+            self.statusBar().showMessage('拟合失败：数据点不足')
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, '导出瀑布图数据', '', 'CSV Files (*.CSV)'
+
+        fit = fit_piecewise_power(xs, ys)
+        if not fit.ok:
+            self.plot.clear_fit_curve()
+            self.lbl_fit_result.setText(
+                f'<span style="color:#c0392b;">拟合失败：{fit.message}</span>')
+            self.statusBar().showMessage(f'拟合失败：{fit.message}')
+            return
+
+        # 从 0 到最大有效转速密采样, 绘制分段幂拟合曲线 (曲线从 0 开始)
+        valid_x = [v for v in xs if v > 0]
+        x_arr = np.linspace(0.0, max(valid_x), 300)
+        y_arr = piecewise_power_curve(fit, x_arr)
+        self.plot.draw_fit_curve(x_arr, y_arr)
+
+        # 显示拟合函数与确定系数 (变形用斜体 δ, 转速用斜体 N)
+        self.lbl_fit_result.setText(
+            f'<b>分段幂函数拟合</b><br>'
+            f'<i>N</i> &lt; {fit.xc:.0f}：<i>δ</i> = {fit.a1:.4g}·<i>N</i>&#8201;<sup>{fit.b1:.3f}</sup><br>'
+            f'<i>N</i> ≥ {fit.xc:.0f}：<i>δ</i> = {fit.a2:.4g}·<i>N</i>&#8201;<sup>{fit.b2:.3f}</sup><br>'
+            f'确定系数 R² = {fit.r2:.4f}（{fit.n_points} 点）<br>'
+            f'<span style="color:#8a96a6; font-size:13px;">'
+            f'（<i>δ</i>=变形 mm，<i>N</i>=转速 RPM）</span>'
         )
-        if not path:
-            return
-        if not path.lower().endswith('.csv'):
-            path += '.CSV'
-        try:
-            with open(path, 'w', encoding='utf-8') as f:
-                # 表头(转速对应时间槽)
-                f.write('频率Hz\\转速rpm;')
-                step_idx = self.cb_step.currentIndex() + 1   # 与原代码逻辑一致
-                for j in range(1, g.recordnum + 1):
-                    temp = int(step_idx * 100 * j)
-                    f.write(f'{temp};')
-                f.write('\n')
 
-                # 数据
-                half = (self.N - 1) // 2
-                for i in range(1, half):
-                    freq = i * self.D
-                    if freq > g.StopFreqHigh:
-                        break
-                    f.write(f'{freq:.2f};')
-                    for j in range(1, g.recordnum + 1):
-                        f.write(f'{self.data_sample_freq[j, i]:.2f};')
-                    f.write('\n')
-            QMessageBox.information(self, '成功', '数据导出成功!')
-        except Exception as e:
-            QMessageBox.warning(self, '失败', str(e))
-
-    def _show_speed_fix_dialog(self):
-        """对应 N1Click — 打开转速修正子窗口"""
-        dlg = SpeedFixDialog(self)
-        dlg.exec_()
+        # 把拟合函数追加保存到本次采集的 CSV 末尾 (δ=变形μm, N=转速RPM)
+        fit_lines = [
+            '',
+            '分段幂函数拟合（δ=变形mm, N=转速RPM）',
+            f'N < {fit.xc:.0f} : δ = {fit.a1:.6g} * N^{fit.b1:.4f}',
+            f'N >= {fit.xc:.0f} : δ = {fit.a2:.6g} * N^{fit.b2:.4f}',
+            f'确定系数 R² = {fit.r2:.4f} （{fit.n_points} 点）',
+        ]
+        saved = self.csv.append_fit(fit_lines)
+        if saved:
+            self.statusBar().showMessage(
+                f'拟合完成：R²={fit.r2:.4f}；拟合函数已追加到 {os.path.basename(saved)}')
+        else:
+            self.statusBar().showMessage(
+                f'拟合完成：R²={fit.r2:.4f}（暂无已保存 CSV，拟合函数未写盘）')
 
     # ============================================================
     # 参数变更事件
     # ============================================================
-    def _on_cb3_change(self, idx):
-        """起始通道变更"""
-        self.daq.channel_start = idx
-        self.cb_freq_ch.setCurrentIndex(idx)
+    def _on_sens_change(self, idx: int):
+        """灵敏度下拉变化: 切换 g.Sensitivity1 与 g.TransPara1。
 
-    def _on_cb4_change(self, txt):
-        try:
-            self.daq.channel_count = int(txt)
-        except ValueError:
-            pass
+        Args:
+            idx: 下拉项索引 (0 = LK-H080 1mV/1.8μm; 其它 = 通用 1.0)
 
-    def _on_cb5_change(self, txt):
-        try:
-            self.daq.sample_rate = float(txt)
-            self.daq.samples = int(self.cb_samples.currentText()) * 2
-            self.daq.interval_count = int(self.cb_samples.currentText())
-        except ValueError:
-            pass
+        Returns:
+            无
 
-    def _on_cb6_change(self, txt):
-        try:
-            self.daq.sample_rate = float(self.cb_rate.currentText())
-            self.daq.samples = int(txt) * 2
-            self.daq.interval_count = int(txt)
-        except ValueError:
-            pass
+        Side Effects:
+            - idx==0: Sensitivity1 = 1/1.8
+            - idx!=0: Sensitivity1 = 1.0
+            - 同步 TransPara1 = 1000 / Sensitivity1
 
-    def _on_cb7_change(self, txt):
-        try:
-            g.StopFreqLow = int(float(txt))
-        except ValueError:
-            pass
-
-    def _on_cb10_change(self, txt):
-        try:
-            g.StopFreqHigh = int(float(txt))
-        except ValueError:
-            pass
-
-    def _on_cb9_change(self, idx):
-        """传感器灵敏度选择(对应 ComboBox9Change)"""
-        table = [8.0, 1.0, 4.78, 0.5, 1.0, 1.0/1.8]
-        if 0 <= idx < len(table):
-            g.Sensitivity1 = table[idx]
-            g.TransPara1 = 1000.0 / g.Sensitivity1
-
-    def _on_cb8_change(self, txt):
-        try:
-            g.Savetime = float(txt)
-            self.progress.setRange(0, int(g.Savetime))
-        except ValueError:
-            pass
-
-    def _on_step_change(self, idx):
-        g.steptime = idx + 2
-
-    def _on_edit1_change(self, txt):
-        try:
-            g.Fxa = float(txt)
-        except ValueError:
-            pass
-
-    def _on_edit2_change(self, txt):
-        try:
-            g.Fxb = float(txt)
-        except ValueError:
-            pass
-
-    def _on_edit3_change(self, txt):
-        try:
-            g.Rpm1 = float(txt)
-        except ValueError:
-            pass
-
-    def _on_edit4_change(self, txt):
-        try:
-            g.Rpm2 = float(txt)
-        except ValueError:
-            pass
+        行为不变量 (与原 main_app.py:481-486 一致)
+        """
+        if idx == 0:
+            g.Sensitivity1 = 1.0 / 1.8
+        else:
+            g.Sensitivity1 = 1.0
+        g.TransPara1 = 1000.0 / g.Sensitivity1
 
     # ============================================================
-    # DAQ 事件回调
+    # DAQ 事件回调 (纯时域逻辑)
     # ============================================================
     def _raise_data_ready(self, offset: int, count: int):
-        """从工作线程切换到 Qt 主线程"""
+        """硬件线程回调: 发射 Qt 信号, 把执行切换到 GUI 线程。
+
+        Args:
+            offset: DAQ 缓冲偏移量 (字节)
+            count:  本次可读样本数
+
+        Returns:
+            无
+
+        Side Effects:
+            - 仅发射 data_ready_signal, 不做任何重活
+
+        说明:
+            DAQNavi SDK 的 on_data_ready 在采集线程中触发, 直接更新 UI 不安全;
+            通过 pyqtSignal -> _on_data_ready (槽函数) 来跨线程派发。
+        """
         self.data_ready_signal.emit(offset, count)
 
     @pyqtSlot(int, int)
     def _on_data_ready(self, offset: int, count: int):
-        """对应 BufferedAiCtrl1DataReady — 核心算法"""
+        """GUI 线程的数据处理入口: 从 DAQ 取一帧, 解算并刷新 UI / CSV。
+
+        Args:
+            offset: DAQ 缓冲偏移量 (未使用, 仅为信号槽签名匹配)
+            count:  本次可读样本数 (= 单帧 ch_count * j)
+
+        Returns:
+            无
+
+        Side Effects:
+            - 从 DAQ 拷出 count 个样本到 numpy 数组
+            - 写入 self.data_arrays[0] (位移) / [1] (转速)
+            - 通过 calc_realspeed 修改 g.Realspeed
+            - 把 g.Realspeed 喂入 hold_detector; 跳入保载时打 t0 并经队列投递弹窗事件
+              (实际弹窗与时延报告在 _show_hold_prompt 中完成)
+            - 通过 calc_deformation 修改 g.Dis2
+            - 通过 plot.add_point 加散点 (横轴=转速 RPM, 纵轴=变形量)
+            - 更新 4 个指示器 Label 和进度条
+            - 若 g.DataSaveFlag 为真且 csv 已打开, 写一行到 CSV
+            - 异常被吞掉, 仅打印 [DataReady ERR]
+
+        行为不变量 (与原 main_app.py:494-571 一致):
+            - 位移通道在切片后乘 TransPara1; 转速通道保留原始电压量纲
+            - 位移通道用 cb_dis_ch (默认 0), 转速通道用 cb_speed_ch (默认 7)
+            - 当 dis_channel 长度 < interval_count 时, 静默 return
+            - 进度条根据 |deformation|/target * 100 计算, 上限 100
+        """
         try:
             ch_count = self.daq.channel_count
             j = count // ch_count
 
-            # ---- 1) 读取数据 ----
             data = self.daq.get_data(count)
             if data is None or len(data) == 0:
                 return
 
-            # ---- 2) 电压标定 V → μm ----
-            data = data * g.TransPara1
+            # ---- 共享采集会话: 同一帧原始电压分发给振动页 (第二条流水线) ----
+            # vib_tab.on_frame 内部自带 try/except, 不会影响径向流水线
+            self.vib_tab.on_frame(data, ch_count, time.time() - self.tick_count)
 
-            # ---- 3) 拆分通道 ----
-            freq_idx = self.cb_freq_ch.currentIndex()
-            speed_idx = self.cb_speed_ch.currentIndex()
+            dis_idx = min(self.cb_dis_ch.currentIndex(), ch_count - 1)
+            speed_idx = min(self.cb_speed_ch.currentIndex(), ch_count - 1)
 
-            # 安全裁剪到实际通道数
-            freq_idx = min(freq_idx, ch_count - 1)
-            speed_idx = min(speed_idx, ch_count - 1)
-
-            # 用 numpy 切片高效拆分(等价于原 for 循环)
-            # data 布局: [pt0_ch0, pt0_ch1, ..., pt0_chN-1, pt1_ch0, ...]
-            self.data_arrays[0] = data[freq_idx::ch_count][:j].copy()
+            # 位移通道: 电压 → μm (只对该通道乘 TransPara1, 避免污染其它通道)
+            self.data_arrays[0] = (data[dis_idx::ch_count][:j] * g.TransPara1).copy()
+            # 转速通道: 保留原始电压 (V), 由 calc_realspeed 直接对 V 求均值
             self.data_arrays[1] = data[speed_idx::ch_count][:j].copy()
 
-            # 振动通道最小值、转速通道求和
-            sum_min = float(np.min(self.data_arrays[0]))
-            sum1 = float(np.sum(self.data_arrays[1])) / (j * g.TransPara1)   # 还原成电压
+            # ======== 转速反推 (写 g.Realspeed) ========
+            calc_realspeed(self.data_arrays[1], j)
 
-            # ---- 4) 实时转速 ----
-            denom = (g.VoltageMax - g.VoltageIni)
-            if abs(denom) < 1e-9:
-                g.Realspeed = 0.0
-            else:
-                g.Realspeed = (sum1 - g.VoltageIni) * g.SpeedMax / denom
-            if g.Realspeed < 0:
-                g.Realspeed = 0.0
-            g.Realspeed += g.SpeedfixNum
+            # ======== 转速保载辨识 + 判定→弹窗时延计时 (算法 4.2 前半) ========
+            # 务实版口径: 判定与投递均在 GUI 线程; 合计 t_ui 计入 S1 判据计算。
+            # 判定成立后入队即返回, 不在数据回调里同步建窗 (不阻塞采集)。
+            self._reading_index += 1
+            t_pre = time.perf_counter()                  # 【S1 起点】判据计算前
+            ev = self.hold_detector.update(g.Realspeed)
+            t0 = time.perf_counter()                     # 【t_ui 起点】判定成立时刻
+            if ev is HoldEvent.ENTER_HOLD:
+                # 记录本次保载转速 (四舍五入), 供 DIC 分析按点击次序自动带入
+                self.dic_tab.record_hold_speed(round(g.Realspeed))
+                # —— S2 触发本地处理: 置软触发状态量 + 记录锚点 (常数次操作) ——
+                self.dic_request_pending = True
+                probe = LatencyProbe(
+                    t_pre=t_pre, t0_perf=t0, t0_wall=time.time(), t_b=0.0,
+                    k=self._reading_index, plateau=self.hold_detector.platform_mean,
+                )
+                probe.t_b = time.perf_counter()          # 【S2 终点】本地处理完, 即将投递
+                # —— S3 跨线程投递: 队列连接, 入队即返回 (采集继续, 不等弹窗) ——
+                self.hold_entered_signal.emit(probe)
 
-            self.lbl_speed[1].setText(f'{g.Realspeed:.1f}')
-            g.Dis1 = -sum_min
-
-            # ---- 5) FFT 与频域处理 ----
-            N = self.N
-            if len(self.data_arrays[0]) < N:
-                # 数据不足时跳过(早期数据可能不满 N)
+            # ======== 变形量计算 (写 g.Dis2) ========
+            dis2, deformation, temps = calc_deformation(
+                self.data_arrays[0], self.daq.interval_count
+            )
+            if dis2 is None:
                 return
 
-            input1 = self.data_arrays[0][:N].astype(np.complex128)
-            output1 = fft_array(input1)
+            # ======== 散点图 + 拟合参考点累积 ========
+            self.plot.add_point(temps, deformation)
 
-            # 频域带阻
-            freqs = np.arange(N) * self.D
-            mask_block = (freqs <= (g.StopFreqLow - 1)) | (freqs >= (g.StopFreqHigh - 1))
-            output1[mask_block] = 0
+            # ======== 更新 UI 指示器 ========
+            self.lbl_speed[1].setText(f'{g.Realspeed:.1f}')
+            self.lbl_dis2[1].setText(f'{dis2:.1f}')
+            self.lbl_def[1].setText(f'{deformation:.1f}')
 
-            # 反 FFT
-            recovered = ifft_array(output1).real
+            try:
+                target_def = float(self.edit_target.text())
+            except Exception:
+                target_def = 100.0
 
-            # ---- 6) 振动统计 ----
-            vib1_max = float(np.max(recovered))
-            vib1_min = float(np.min(recovered))
-            g.Vib1 = vib1_max - vib1_min
-            g.Dis2 = -float(np.sum(recovered)) / N
+            rate = 0.0
+            if target_def > 0:
+                rate = min(100.0, abs(deformation) / target_def * 100.0)
+            self.lbl_rate[1].setText(f'{rate:.1f}')
+            self.progress.setValue(int(rate))
 
-            self.lbl_vib[1].setText(f'{g.Vib1:.0f}')
-            self.lbl_dis2[1].setText(f'{g.Dis2:.1f}')
-
-            # ---- 7) 频谱图(幅值 + 相位) ----
-            self.fxy = output1.copy()
-            half = (N - 1) // 2
-
-            # 只保留 0 < f <= StopFreqHigh 的部分
-            ks = np.arange(1, half + 1)
-            fs_x = ks * self.D
-            mask_show = fs_x <= g.StopFreqHigh
-            xs = fs_x[mask_show]
-            mags = np.abs(self.fxy[1:half+1][mask_show]) * 2.0 / N
-            phs = np.angle(self.fxy[1:half+1][mask_show]) * 180.0 / np.pi
-
-            self.curve_mag.setData(xs, mags)
-            self.curve_phase.setData(xs, phs)
-
-            # 主峰(对应 ilabel11/8/14)
-            if len(mags) > 0:
-                peak_idx = int(np.argmax(mags))
-                self.HzMax = float(xs[peak_idx])
-                self.HzMag = float(mags[peak_idx])
-                self.Phase = float(phs[peak_idx])
-            else:
-                self.HzMax = 0
-                self.HzMag = 0
-                self.Phase = 0
-
-            self.lbl_freq[1].setText(f'{self.HzMax:.0f}')
-            self.lbl_phase[1].setText(f'{self.Phase:.0f}')
-            self.lbl_mag[1].setText(f'{self.HzMag:.0f}')
-
-            # ---- 8) 振动趋势曲线 ----
-            t_now = time.time() - self.tick_count1
-            # 用历史 X-Y 列表持续累积
-            xs_t, ys_t = self.curve_trend.getData()
-            if xs_t is None:
-                xs_t = np.array([])
-                ys_t = np.array([])
-            xs_t = np.append(xs_t, t_now)
-            ys_t = np.append(ys_t, g.Vib1)
-            self.curve_trend.setData(xs_t, ys_t)
-
-            # 瀑布图缓存
-            if g.steptime > 0:
-                idx = int(t_now) // g.steptime
-                if idx < self.data_sample_freq.shape[0]:
-                    full_mag = np.abs(self.fxy) * 2.0 / N
-                    self.data_sample_freq[idx, :] = full_mag
-                    g.freqarr = idx
-                    g.recordnum = idx
-
-            # ---- 9) 数据落盘 ----
-            if g.DataSaveFlag and self.csv_file is not None:
+            # ======== CSV 落盘 ========
+            if g.DataSaveFlag and self.csv.is_open:
                 elapsed = time.time() - self.tick_count
-                self.csv_file.write(
-                    f'{elapsed:.4f} {g.Dis0:.4f} {g.Dis2:.4f} '
-                    f'{(g.Dis2 - g.Dis0):.4f} {g.Vib1:.4f} {g.Realspeed:.4f}\n'
-                )
-                self.csv_file.flush()
-                if g.Savetime > 0:
-                    self.progress.setValue(min(int(elapsed), int(g.Savetime)))
+                self.csv.write_row(elapsed, g.Dis0, dis2, deformation, g.Realspeed)
 
         except Exception as e:
             print(f'[DataReady ERR] {e}')
-            import traceback
-            traceback.print_exc()
-            # 出错时安全停止
+
+    @pyqtSlot(object)
+    def _show_hold_prompt(self, probe):
+        """GUI 线程槽: 取出判定事件 → 弹非模态提示窗 → 刷新时延报告窗 (算法 4.2 后半)。
+
+        Args:
+            probe: LatencyProbe, 含采集判定侧打点 (t0 / t_b / k / 平台均值)
+
+        Returns:
+            无
+
+        Side Effects:
+            - 在 probe 上补打 t_c (S3 终点) 与 t_show (t_ui 终点)
+            - 创建/刷新 DIC 提示窗与时延报告窗 (均非模态)
+            - 控制台打印 t_ui 及各流程耗时; 超 0.1s 限值则告警
+
+        口径:
+            t_c 取本槽开始执行时刻 = 跨线程投递 (S3) 终点; t_show 取提示窗
+            show()+repaint() 之后 = 弹窗可见时刻 = t_ui 终点。
+        """
+        probe.t_c = time.perf_counter()          # 【S3 终点】槽开始执行
+        self._present_dic_box(probe)             # 建非模态提示窗 + 强制首绘, 内部填 t_show
+        self._present_latency_report(probe)      # 第二个窗口: 单次刷新时延报告
+        st = probe.stages()
+        if st['t_ui'] >= LatencyReportWindow.LIMIT_S:
+            print(f"[t_ui 告警] {st['t_ui'] * 1000:.3f} ms 超过 100 ms 限值")
+        else:
+            print(f"[t_ui] {st['t_ui'] * 1000:.3f} ms 达标 | "
+                  f"S1={st['t_calc'] * 1000:.3f} S2={st['t_trig'] * 1000:.3f} "
+                  f"S3={st['t_post'] * 1000:.3f} S4+5={st['t_render'] * 1000:.3f} ms")
+
+    def _present_dic_box(self, probe):
+        """创建并显示非模态「可进行 DIC 采样」提示窗, 强制首绘并记录 t_show。
+
+        Args:
+            probe: LatencyProbe; 本方法在其上写 t_show_perf / t_show_wall
+
+        Returns:
+            无
+
+        Side Effects:
+            - 关闭上一个提示窗 (多级保载: 新提示取代旧提示, 非模态不阻塞)
+            - 新建 QMessageBox (非模态, WA_DeleteOnClose), show() + repaint()
+            - repaint 后立即在 probe 上打 t_show (perf + 墙钟)
+            - 不调用 activateWindow (非模态不抢焦点); 触发提示音
+
+        行为不变量:
+            - 必须先 show() 再 repaint() 再读 t_show (确保"首次绘制可见")
+        """
+        if self._dic_ready_box is not None:
+            self._dic_ready_box.close()          # finished → _on_dic_ready_closed 置 None
+            self._dic_ready_box = None
+        box = QMessageBox(self)
+        box.setWindowTitle('转速保载')
+        box.setIcon(QMessageBox.Information)
+        box.setText(f'转速已进入稳定（{probe.plateau:.0f} RPM），可以开始 DIC 采样')
+        box.setStandardButtons(QMessageBox.Ok)
+        box.setModal(False)
+        box.setAttribute(Qt.WA_DeleteOnClose, True)
+        box.finished.connect(self._on_dic_ready_closed)
+        self._dic_ready_box = box
+        box.show()
+        box.repaint()                            # 强制首绘, 确保"可见"
+        probe.t_show_perf = time.perf_counter()  # 【t_ui 终点】弹窗可见时刻
+        probe.t_show_wall = time.time()
+        box.raise_()
+        try:
+            QApplication.beep()
+        except Exception:
+            pass
+
+    def _present_latency_report(self, probe):
+        """惰性创建 / 单次刷新单例「判定—弹窗时延报告」窗口。
+
+        Args:
+            probe: 已填齐两侧打点的 LatencyProbe
+
+        Returns:
+            无
+
+        Side Effects:
+            - 首次调用创建 self._latency_report (LatencyReportWindow), 之后复用刷新
+            - 非模态显示并 raise_ (不抢焦点)
+        """
+        if self._latency_report is None:
+            self._latency_report = LatencyReportWindow(self)
+        self._latency_report.update_report(probe)
+        self._latency_report.show()
+        self._latency_report.raise_()
+
+    def _on_dic_ready_closed(self, _result: int):
+        """DIC 提示框关闭回调: 清空引用, 允许下次保载再次弹窗。
+
+        Args:
+            _result: QDialog 完成码 (未使用, 仅匹配 finished 信号签名)
+
+        Returns:
+            无
+
+        Side Effects:
+            - self._dic_ready_box = None
+        """
+        self._dic_ready_box = None
+
+    def _on_overrun(self, offset: int, count: int):
+        """DAQ 缓冲区 Overrun 警告: 仅首次弹窗, 后续静默。
+
+        Args:
+            offset: 偏移量 (未使用)
+            count:  样本数 (未使用)
+
+        Returns:
+            无
+
+        Side Effects:
+            - 首次触发时弹 QMessageBox.warning 并设 self.is_first_overrun = False
+            - 后续触发不弹窗 (避免频繁报警)
+        """
+        if self.is_first_overrun:
+            QMessageBox.warning(self, '系统警告', '底层缓冲区发生 Overrun')
+            self.is_first_overrun = False
+
+    def _on_cache_overflow(self, offset: int, count: int):
+        """驱动层 CacheOverflow 错误: 弹严重错误框, 每次都弹。
+
+        Args:
+            offset: 偏移量 (未使用)
+            count:  样本数 (未使用)
+
+        Returns:
+            无
+
+        Side Effects:
+            - 弹 QMessageBox.critical
+        """
+        QMessageBox.critical(self, '系统错误', '驱动层 CacheOverflow')
+
+    def _raise_disconnect(self):
+        """采集卡断开回调 (真卡轮询线程内调用): 发射 Qt 信号切到 GUI 线程处理。
+
+        Args:
+            无
+
+        Returns:
+            无
+
+        Side Effects:
+            - 仅 emit disconnect_signal (线程安全); 报警/停止在 _on_disconnect 完成
+        """
+        self.disconnect_signal.emit()
+
+    @pyqtSlot()
+    def _on_disconnect(self):
+        """采集卡断开的 GUI 处理: 自动停止采集 + 状态栏 + 弹窗报警 (仅真卡采集时触发)。
+
+        Args:
+            无
+
+        Returns:
+            无
+
+        Side Effects:
+            - 仅在采集中生效 (防重复): 置 g.DataSaveFlag=False; 容错停 DAQ; 关 CSV;
+              复位按钮; 停 timer2
+            - 状态栏显示断开; 弹出 QMessageBox.critical 报警
+
+        说明:
+            回调在真卡轮询线程触发, 经 disconnect_signal 队列投递到本槽 (GUI 线程),
+            故可安全操作界面。此处用容错停止 (不复用 _btn_stop_click), 避免因卡已拔而
+            再弹"停止失败"/"保存成功"。
+        """
+        if self.session_state == 'idle':
+            return   # 不在采集中, 忽略 (防重复/延迟触发)
+        self._card_present = False   # 同步在线状态, 避免监视器重复报"断开"
+        g.DataSaveFlag = False
+        try:
+            self.daq.stop()          # 卡已拔, 容错停止 (吞掉可能的错误)
+        except Exception:
+            pass
+        self.csv.close()             # 关闭径向数据文件 (幂等, 保住已采数据)
+        self.vib_tab.close_csv()     # 关闭振动数据文件 (幂等)
+        self.timer2.stop()
+        self.session_state = 'idle'
+        self._apply_run_state()
+        self.statusBar().showMessage('采集卡已断开，采集已自动停止')
+        QMessageBox.critical(
+            self, '采集卡断开',
+            '检测到 USB-4716 采集卡已断开，采集已自动停止。\n'
+            '请检查采集卡连接后，重启程序以重新识别采集卡。'
+        )
+
+    def _monitor_devices(self):
+        """设备在线监视 (monitor_timer, ~0.5s): 空闲时轻量枚举, 检测采集卡断开/重连。
+
+        Args:
+            无
+
+        Returns:
+            无
+
+        Side Effects:
+            - 真卡采集中直接返回 (断开由真卡轮询线程负责, 不枚举以免干扰);
+              模拟器运行中仍监视 (以便检出中途插卡)
+            - 进入"检测到卡→停用模拟器→待重启"状态后不再处理
+            - 用 real_device_present() 查在线状态, 与 _card_present 比较, 翻转则:
+              不在→在: 置闩锁 _card_ever_seen; 在用模拟器 → _disable_simulator_for_card
+                       (决定 a: 停用模拟器 + 提示重启); 否则(真卡) → 弹"已重新连接"
+              在→不在: 弹"采集卡已断开"(空闲, 无采集可停)
+
+        说明:
+            闩锁: 本次运行一旦检测到真卡, 就不再用模拟器; 想用模拟器须重启并断开卡。
+            状态先更新再弹窗, 防模态期间定时器重入导致重复弹窗。
+        """
+        # 真卡采集中: 断开由轮询线程负责, 不枚举; 模拟器采集中仍监视 (为检出插卡)
+        if self.daq.is_running and not self._on_simulator:
+            return
+        # 已"检测到卡→停用模拟器→待重启": 不再监视/弹窗
+        if self._on_simulator and self._card_ever_seen:
+            return
+        present = real_device_present()
+        if present == self._card_present:
+            return
+        self._card_present = present
+        if present:
+            self._card_ever_seen = True              # 置闩锁: 本次运行不再用模拟器
+            if self._on_simulator:
+                self._disable_simulator_for_card()   # 决定 a: 停用模拟器 + 提示重启
+            else:
+                self.statusBar().showMessage('采集卡已重新连接')
+                QMessageBox.information(
+                    self, '采集卡重连',
+                    '检测到 USB-4716 采集卡已重新连接。\n'
+                    '如需使用真卡采集，请重启程序以重新识别采集卡。'
+                )
+        else:
+            self.statusBar().showMessage('采集卡已断开')
+            QMessageBox.warning(
+                self, '采集卡断开',
+                '检测到 USB-4716 采集卡已断开。'
+            )
+
+    def _disable_simulator_for_card(self):
+        """检测到真卡时停用模拟器 (决定 a): 停止模拟采集 + 禁用采集按钮 + 提示重启。
+
+        Args:
+            无
+
+        Returns:
+            无
+
+        Side Effects:
+            - 若模拟器正在采集: 置 g.DataSaveFlag=False, 停 DAQ, 关 CSV, 停 timer2
+            - 禁用 开始/停止/刷新 按钮 (本次运行模拟器不可再用; 须重启)
+            - 状态栏提示 + 弹窗告知"检测到采集卡, 模拟器已停用, 请重启"
+
+        说明:
+            闩锁 _card_ever_seen 已置位; 此后即使按钮被别处启用, _btn_start_click 也会
+            拦截并提示重启。想用模拟器: 重启程序并断开采集卡。
+        """
+        if self.daq.is_running:
+            g.DataSaveFlag = False
             try:
                 self.daq.stop()
             except Exception:
                 pass
-            self.btn_start.setEnabled(True)
-            self.btn_pause.setEnabled(False)
-
-    def _on_overrun(self, offset: int, count: int):
-        if self.is_first_overrun:
-            QMessageBox.warning(self, 'StreamingAI', 'BufferedAiOverrun')
-            self.is_first_overrun = False
-
-    def _on_cache_overflow(self, offset: int, count: int):
-        QMessageBox.critical(self, 'StreamingAI', 'BufferedAiCacheOverflow')
+            self.csv.close()
+            self.vib_tab.close_csv()
+            self.timer2.stop()
+        self.session_state = 'idle'
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(False)
+        self.btn_refresh.setEnabled(False)
+        # 振动页同样锁死采集入口 (须重启后才能用真卡)
+        self.vib_tab.set_run_state('idle')
+        self.vib_tab.btn_start.setEnabled(False)
+        self.statusBar().showMessage('检测到采集卡，模拟器已停用，请重启程序以使用真卡')
+        QMessageBox.information(
+            self, '检测到采集卡',
+            '检测到 USB-4716 采集卡已连接，模拟器已停用。\n'
+            '请重启程序：接好采集卡启动即用真卡采集。'
+        )
 
     # ============================================================
     # 定时器
     # ============================================================
     def _on_timer2(self):
-        """对应 Timer2Timer — 周期性绘制 XY 变形点"""
+        """timer2 (200ms 周期): 5Hz 节流的绘图坐标自动缩放。
+
+        Args:
+            无
+
+        Returns:
+            无
+
+        Side Effects:
+            - 读 g.Dis0 / g.Dis2 / g.Realspeed 计算当前 temps 与 deformation
+            - 调用 self.plot.auto_scale() 仅放大坐标
+            - 异常吞掉仅打印 [Timer2 ERR]
+
+        说明:
+            原版的 5Hz 节流是为了避免 _on_data_ready (高频) 中频繁 setRange 导致
+            画面抖动; 因此 add_point 立即生效, setRange 仅由本定时器触发。
+        """
         try:
-            deformation = g.Dis0 - g.Dis2
-            temps = g.Realspeed ** 2 * 1e-6
-
-            # 加点到散点
-            current = self.scatter_xy.data
-            self.scatter_xy.addPoints(x=[temps], y=[deformation])
-
-            # 收集拟合采样点
-            if temps > g.Rpm1:
-                if g.SumCount1 < 20:
-                    g.SumD1[g.SumCount1] = deformation
-                    g.SumS1[g.SumCount1] = temps
-                    g.SumCount1 += 1
-            if temps > g.Rpm2:
-                if g.SumCount2 < 20:
-                    g.SumD2[g.SumCount2] = deformation
-                    g.SumS2[g.SumCount2] = temps
-                    g.SumCount2 += 1
-
-            # 残余偏差
-            g.LeftDF = deformation - g.Fxa * temps - g.Fxb
-            self.lbl_left_df[1].setText(f'{g.LeftDF:.1f}')
-
-            if g.Savetime > 0:
-                ratio = abs(g.LeftDF) * self.progress.maximum() / g.Savetime
-                self.progress.setValue(min(int(ratio), self.progress.maximum()))
-
-            # 动态坐标
-            vb = self.plotxy.getViewBox()
-            (xmin, xmax), (ymin, ymax) = vb.viewRange()
-            if temps * 1.1 > xmax:
-                self.plotxy.setXRange(0, temps * 1.2)
-            if deformation > ymax:
-                self.plotxy.setYRange(0, deformation * 1.2)
+            deformation = g.Dis2 - g.Dis0
+            temps = g.Realspeed
+            self.plot.auto_scale(temps, deformation)
         except Exception as e:
             print(f'[Timer2 ERR] {e}')
 
     def _on_timer1(self):
-        """对应 Timer1Timer — 保存完成提示"""
-        if self.csv_file is not None:
-            try:
-                self.csv_file.close()
-            except Exception:
-                pass
-            self.csv_file = None
-            QMessageBox.information(self, '提示', '保存数据成功!')
-            self.progress.setValue(0)
+        """timer1 (停止采集后 100ms 单次): 关闭 CSV, 弹出保存成功提示。
 
-    def _on_timer4(self):
-        """对应 Timer4Timer — 启动后延时建数据文件"""
-        try:
-            now = datetime.now()
-            date_str = now.strftime('%Y%m%d')
-            base = os.path.join(self.exe_directory, 'data')
-            i = 1
-            s1 = '01'
-            sub = f'{date_str}{s1}'
-            full = os.path.join(base, sub)
-            while os.path.exists(full):
-                i += 1
-                s1 = f'{i:02d}'
-                sub = f'{date_str}{s1}'
-                full = os.path.join(base, sub)
-            os.makedirs(full, exist_ok=True)
-            g.Filestrtemp = full
-            self.test_no = f'{date_str}{s1}'
-            g.TestNoTemp = self.test_no
-            self.csv_path = os.path.join(full, f'{self.test_no}.CSV')
+        Args:
+            无
 
-            self.csv_file = open(self.csv_path, 'w', encoding='utf-8')
-            self.csv_file.write(f'{self.cb_freq_ch.currentText()}\n')
-            self.csv_file.write(f'采样频率: {self.daq.sample_rate}\n')
-            self.csv_file.write(f'采集时长: {self.cb_save_time.currentText()}s\n')
-            self.csv_file.write('时间 初始位移 当前位移 变形量 振动幅值 转速\n')
-            g.DataSaveFlag = True
-            self.tick_count = time.time()
-        except Exception as e:
-            QMessageBox.warning(self, '保存出错', f'保存数据出错,程序退出:\n{e}')
+        Returns:
+            无
 
-    # ============================================================
-    # 鼠标在振动趋势曲线上悬停 -> 显示对应时刻的频谱
-    # ============================================================
-    def _on_plot2_hover(self, evt):
-        """对应 iPlot2GetMouseCursorDataCursor"""
-        if not g.Freqenable or self.data_sample_freq is None:
-            return
-        if not self.plot2.sceneBoundingRect().contains(evt):
-            return
-        mouse_point = self.plot2.plotItem.vb.mapSceneToView(evt)
-        tx = mouse_point.x()
-        if tx < 0 or g.steptime <= 0:
-            return
-        ix = int(round(tx)) // g.steptime
-        if 0 <= ix <= 100 and ix < self.data_sample_freq.shape[0]:
-            half = (self.N - 1) // 2
-            ks = np.arange(1, half)
-            fs_x = ks * self.D
-            mask = fs_x < g.StopFreqHigh
-            xs = fs_x[mask]
-            ys = self.data_sample_freq[ix, 1:half][mask]
-            self.curve_inst.setData(xs, ys)
+        Side Effects:
+            - 若 CSV 仍然打开, 调用 self.csv.close()
+            - 弹 QMessageBox.information 显示 CSV / PNG 路径
+
+        行为不变量 (与原 main_app.py:599-610 一致):
+            - 文案 '保存数据成功!\\n\\n数据文件: ...' 不变
+            - 当 bmp_path / 振动文件路径非空才追加对应行
+            - 100ms 延时是为了让 _on_data_ready 写完最后一帧再关文件
+        """
+        if self.csv.is_open:
+            self.csv.close()
+            msg = f"保存数据成功!\n\n数据文件: {self.csv.path}"
+            vib_csv = getattr(self.vib_tab.csv, 'path', '')
+            if vib_csv:
+                msg += f"\n振动数据文件: {vib_csv}"
+            if self.bmp_path:
+                msg += f"\n图形文件: {self.bmp_path}"
+            if self._vib_png:
+                msg += f"\n频谱图形: {self._vib_png}"
+            QMessageBox.information(self, '保存数据成功', msg)
 
     # ============================================================
     # 关闭窗口
     # ============================================================
     def closeEvent(self, event):
+        """窗口关闭事件: 停止 DAQ → 清理硬件 → 关闭 CSV → 接受事件。
+
+        Args:
+            event: QCloseEvent 实例
+
+        Returns:
+            无 (通过 event.accept() 允许关闭)
+
+        Side Effects:
+            - 若 DAQ 仍在跑, 调用 stop() (异常吞掉)
+            - 调用 self.daq.cleanup()
+            - 调用 self.csv.close() (幂等)
+            - event.accept() 允许窗口关闭
+        """
         try:
             if self.daq.is_running:
                 self.daq.stop()
             self.daq.cleanup()
         except Exception:
             pass
-        if self.csv_file is not None:
-            try:
-                self.csv_file.close()
-            except Exception:
-                pass
+        self.csv.close()
+        if hasattr(self, 'vib_tab'):
+            self.vib_tab.close_csv()
         event.accept()
 
 
@@ -1206,12 +1195,24 @@ class MainForm(QMainWindow):
 # 程序入口
 # =============================================================================
 def main():
+    """应用程序入口: 创建 QApplication, 实例化 MainForm, 进入事件循环。
+
+    Args:
+        无
+
+    Returns:
+        无 (通过 sys.exit() 退出)
+
+    Side Effects:
+        - 创建 QApplication 单例 (使用 sys.argv)
+        - 设置 'Fusion' 样式
+        - 创建并显示主窗口
+        - 阻塞执行 app.exec_() 直到窗口关闭
+    """
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-
     win = MainForm()
     win.show()
-
     sys.exit(app.exec_())
 
 

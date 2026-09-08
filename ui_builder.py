@@ -232,7 +232,7 @@ def _build_measure_tab(form) -> QWidget:
     lay_b.addRow('采集时长(s):', form.cb_save_time)
 
     form.btn_fit = QPushButton('开始拟合')
-    form.btn_fit.setToolTip('仅对升速包络数据拟合：弹性段 a·n²，塑性段 p>2；同步重算实测残余变形')
+    form.btn_fit.setToolTip('仅对升速包络数据拟合：1.9≤p≤2.1 为弹性，p>2.1 为塑性；有弹性分界点时重算实测残余变形')
     form.btn_fit.clicked.connect(form._btn_fit_click)
     lay_b.addRow(form.btn_fit)
 

@@ -616,25 +616,34 @@ class MainForm(QMainWindow):
         self.plot.draw_fit_curve(x_arr, y_arr)
         self.plot.set_residual_fit(fit)
 
-        if fit.plastic:
+        if fit.plastic and fit.has_elastic_segment:
             formula_html = (
-                f'<i>N</i> ≤ {fit.xc:.0f}：<i>δ</i> = {fit.a1:.4g}·<i>N</i><sup>2</sup>（弹性）<br>'
-                f'<i>N</i> &gt; {fit.xc:.0f}：<i>δ</i> = {fit.a2:.4g}·<i>N</i><sup>{fit.b2:.3f}</sup>（塑性）<br>'
+                f'<i>N</i> ≤ {fit.xc:.0f}：<i>δ</i> = {fit.a1:.4g}·<i>N</i><sup>{fit.b1:.10g}</sup>（弹性）<br>'
+                f'<i>N</i> &gt; {fit.xc:.0f}：<i>δ</i> = {fit.a2:.4g}·<i>N</i><sup>{fit.b2:.10g}</sup>（塑性）<br>'
                 f'最大弹性变形 = {fit.max_elastic_deformation:.6f} mm<br>')
             formula_lines = [
-                f'N <= {fit.xc:.0f} : δ = {fit.a1:.6g} * N^2',
-                f'N > {fit.xc:.0f} : δ = {fit.a2:.6g} * N^{fit.b2:.4f}',
+                f'N <= {fit.xc:.0f} : δ = {fit.a1:.6g} * N^{fit.b1:.12g}',
+                f'N > {fit.xc:.0f} : δ = {fit.a2:.6g} * N^{fit.b2:.12g}',
             ]
             heading = '弹塑性分段幂函数拟合'
+        elif fit.plastic:
+            formula_html = (
+                f'<i>δ</i> = {fit.a1:.4g}·<i>N</i><sup>{fit.b1:.10g}</sup>（塑性模型）<br>'
+                '幂指数 &gt; 2.1；缺少弹性分界点，残余变形待判定<br>')
+            formula_lines = [
+                f'δ = {fit.a1:.6g} * N^{fit.b1:.12g}',
+                '幂指数 > 2.1；缺少弹性分界点，残余变形待判定',
+            ]
+            heading = '塑性幂函数拟合（缺少弹性段）'
         else:
             formula_html = (
-                f'<i>δ</i> = {fit.a1:.4g}·<i>N</i><sup>2</sup>（弹性模型）<br>'
+                f'<i>δ</i> = {fit.a1:.4g}·<i>N</i><sup>{fit.b1:.10g}</sup>（弹性模型）<br>'
                 f'尚未检出可靠塑性段；有效范围至 {fit.max_rpm:.0f} RPM<br>')
             formula_lines = [
-                f'δ = {fit.a1:.6g} * N^2',
+                f'δ = {fit.a1:.6g} * N^{fit.b1:.12g}',
                 f'尚未检出可靠塑性段；有效范围至 {fit.max_rpm:.0f} RPM',
             ]
-            heading = '弹性二次函数拟合'
+            heading = '弹性幂函数拟合（1.9≤p≤2.1）'
         self.lbl_fit_result.setText(
             f'<b>{heading}</b><br>{formula_html}'
             f'确定系数 R² = {fit.r2:.4f}（{fit.n_points} 点）<br>'

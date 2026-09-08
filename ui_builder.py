@@ -45,6 +45,7 @@ import pyqtgraph as pg
 from public_para import g
 from dic_tab import DicAnalysisTab
 from vibration_tab import VibrationTab
+from square_plot_widget import SquarePlotWidget
 
 
 # 全局样式 (浅色 + 蓝色主色, 参考疲劳寿命预测程序的现代观感)
@@ -279,10 +280,12 @@ def _build_measure_tab(form) -> QWidget:
     left_widget = QWidget()
     left_widget.setLayout(left_col)
     left_widget.setMinimumWidth(440)
+    # 明确保留控制区所需高度，避免窗口缩小时按钮文字被强行压扁。
+    left_widget.setMinimumHeight(left_col.minimumSize().height())
     mid.addWidget(left_widget, 1)      # 与右图各给伸缩因子 1 → 左右严格中分
 
     # ---- 右半栏: 散点图 (变形量-转速) ----
-    form.plotxy = pg.PlotWidget(title='变形量-转速')
+    form.plotxy = SquarePlotWidget(title='变形量-转速')
     form.plotxy.setLabel('left', '变形量', units='mm')
     # 纵轴关闭自动 SI 前缀: 不足 1mm 的变形量按小数/科学计数显示,
     # 不再被自动套前缀缩放 (避免 "0.99 mm" 被显示成 "990 mmm" 之类)
@@ -333,6 +336,7 @@ def build_main_ui(form) -> None:
     """
     form.setWindowTitle('在线变形测试系统')
     form.resize(1200, 800)
+    form.setMinimumSize(1100, 760)
     form.setStyleSheet(APP_QSS)
 
     # ============================================================
@@ -386,3 +390,28 @@ def build_main_ui(form) -> None:
     form.timer1.setSingleShot(True)
     form.timer1.setInterval(100)
     form.timer1.timeout.connect(form._on_timer1)
+
+    # 等所有控件加入窗口、继承字体/样式后再计算最小尺寸；不改事件或采集逻辑。
+    QTimer.singleShot(0, lambda: _preserve_control_sizes(form))
+
+
+def _preserve_control_sizes(form):
+    """按实际样式保留操作区的最小高度，防止小窗口裁切按钮文字。"""
+    form.ensurePolished()
+    for button in (form.btn_zero, form.btn_start, form.btn_stop, form.btn_refresh):
+        button.ensurePolished()
+        button.setMinimumHeight(button.sizeHint().height())
+    for panel in (form.btn_start.parentWidget().parentWidget(),
+                  form.dic_tab.sp_speed.parentWidget().parentWidget()):
+        panel.layout().invalidate()
+        panel.setMinimumHeight(panel.layout().minimumSize().height())
+    form.centralWidget().layout().activate()
+    # 只按本次调整的两个页面计算，避免振动页或长文件名抬高整个窗口的最小宽度。
+    chrome_height = form.height() - form.tabs.currentWidget().height()
+    page_heights = []
+    for page in (form.tabs.widget(0), form.dic_tab):
+        page.layout().invalidate()
+        page_heights.append(max(page.layout().minimumSize().height(),
+                                page.layout().heightForWidth(page.width())))
+    page_height = max(page_heights)
+    form.setMinimumSize(1100, max(760, page_height + chrome_height))

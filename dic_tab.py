@@ -37,6 +37,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QFormLayout, QDoubleSpinBox, QApplication,
 )
 import pyqtgraph as pg
+from square_plot_widget import SquarePlotWidget
 
 from dic_analysis import (
     analyze_max_field, list_dic_files, available_metrics, to_cylindrical,
@@ -183,10 +184,11 @@ class DicAnalysisTab(QWidget):
         left_widget = QWidget()
         left_widget.setLayout(left_col)
         left_widget.setMinimumWidth(460)
+        left_widget.setMinimumHeight(left_col.minimumSize().height())
         mid.addWidget(left_widget, 1)      # 与右图各给伸缩因子 1 → 左右严格中分
 
         # ===== 右半栏: 应变-转速 散点图 (累加, 悬停显示数值) =====
-        self.plot = pg.PlotWidget()
+        self.plot = SquarePlotWidget()
         self.plot.setMinimumWidth(480)
         self.plot.setLabel('bottom', '转速', units='RPM')
         self.plot.setLabel('left', '应变', units='%')

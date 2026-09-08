@@ -903,13 +903,11 @@ class MainForm(QMainWindow):
 
         Side Effects:
             - 首次调用创建 self._latency_report (LatencyReportWindow), 之后复用刷新
-            - 非模态显示并 raise_ (不抢焦点)
+            - 仅在后台更新报告内容，不显示或置顶；计时、阈值判断与控制台输出不变
         """
         if self._latency_report is None:
             self._latency_report = LatencyReportWindow(self)
         self._latency_report.update_report(probe)
-        self._latency_report.show()
-        self._latency_report.raise_()
 
     def _on_dic_ready_closed(self, _result: int):
         """DIC 提示框关闭回调: 清空引用, 允许下次保载再次弹窗。

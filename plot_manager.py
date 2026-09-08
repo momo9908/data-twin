@@ -171,7 +171,7 @@ class PlotManager:
 
     def _show_residual(self, value, state):
         if self.residual_label is not None:
-            number = '—' if value is None else f'{value:.6f} mm'
+            number = '—' if value is None else f'{value:#.3g} mm'
             self.residual_label.setText(f'轮盘当前残余变形：{number}（{state}）')
 
     def _append_residual(self, rpm, deformation_mm, rising):

@@ -55,8 +55,9 @@ from dialogs import SpeedFixDialog
 from settings_io import load_device_set
 from ui_builder import build_main_ui
 from data_processor import (
-    calc_realspeed, calc_deformation, fit_piecewise_power, piecewise_power_curve,
+    calc_realspeed, calc_deformation, piecewise_power_curve,
 )
+from elastic_plastic import fit_elastic_plastic
 from csv_logger import CSVLogger, make_dated_folder
 from plot_manager import PlotManager
 from speed_stability import LoadHoldDetector, HoldEvent
@@ -204,7 +205,8 @@ class MainForm(QMainWindow):
         build_main_ui(self)
 
         # 把 ui_builder 创建的绘图控件注入 PlotManager
-        self.plot.attach(self.plotxy, self.scatter_xy, self.fit_curve)
+        self.plot.attach(self.plotxy, self.scatter_xy, self.fit_curve,
+                         self.residual_curve, self.lbl_residual)
 
         # 硬件初始化推迟到事件循环启动后执行, 避免阻塞窗口显示
         QTimer.singleShot(0, self._form_create)
@@ -564,6 +566,7 @@ class MainForm(QMainWindow):
             - 弹窗文案 '当前位置已设定为零点\\nDis0 = X.XX μm' 保留 2 位小数
         """
         g.Dis0 = g.Dis2
+        self.plot.residual_zero_changed()
         QMessageBox.information(
             self, '归零成功',
             f'当前位置已设定为零点\nDis0 = {g.Dis0:.2f} μm'
@@ -598,38 +601,9 @@ class MainForm(QMainWindow):
         self.statusBar().showMessage('已清空采集显示数据（已保存的 CSV 文件不受影响）')
 
     def _btn_fit_click(self):
-        """[开始拟合] 按钮: 用分段幂函数拟合当前采集的 转速-变形 数据并绘曲线。
-
-        Args:
-            无
-
-        Returns:
-            无
-
-        Side Effects:
-            - 从 self.plot.get_points() 取累加的 (转速, 变形) 点
-            - 调用 data_processor.fit_piecewise_power 做两段幂函数最小二乘拟合
-            - 成功: self.plot.draw_fit_curve 在右图画拟合曲线, 并把拟合函数 (变形用
-              斜体 δ、转速用斜体 N) 与确定系数 R² 写入 self.lbl_fit_result
-            - 成功且本次采集已存 CSV 时: 调用 self.csv.append_fit 把拟合函数追加到
-              该 CSV 末尾 (不影响已存的采集数据)
-            - 失败/数据不足: 清空拟合曲线, 在 lbl_fit_result 红字显示原因
-            - 全程不弹窗, 结果就地显示在"变形拟合及目标设定"栏
-
-        说明:
-            分段幂函数 y=a·x^b 两段、自动搜索断点、各段独立最小二乘 (scipy.curve_fit),
-            仅用 x>0 且 y>0 的点。
-        """
-        xs, ys = self.plot.get_points()
-        if len(xs) < 8:
-            self.plot.clear_fit_curve()
-            self.lbl_fit_result.setText(
-                f'<span style="color:#c0392b;">数据点不足（{len(xs)}），'
-                f'请先采集后再拟合。</span>')
-            self.statusBar().showMessage('拟合失败：数据点不足')
-            return
-
-        fit = fit_piecewise_power(xs, ys)
+        """仅对径向升速包络拟合弹性/弹塑性模型，更新曲线、残余值及原有公式记录。"""
+        xs, ys = self.plot.get_rising_points()
+        fit = fit_elastic_plastic(xs, ys)
         if not fit.ok:
             self.plot.clear_fit_curve()
             self.lbl_fit_result.setText(
@@ -637,28 +611,40 @@ class MainForm(QMainWindow):
             self.statusBar().showMessage(f'拟合失败：{fit.message}')
             return
 
-        # 从 0 到最大有效转速密采样, 绘制分段幂拟合曲线 (曲线从 0 开始)
-        valid_x = [v for v in xs if v > 0]
-        x_arr = np.linspace(0.0, max(valid_x), 300)
+        x_arr = np.linspace(0.0, fit.max_rpm, 300)
         y_arr = piecewise_power_curve(fit, x_arr)
         self.plot.draw_fit_curve(x_arr, y_arr)
+        self.plot.set_residual_fit(fit)
 
-        # 显示拟合函数与确定系数 (变形用斜体 δ, 转速用斜体 N)
+        if fit.plastic:
+            formula_html = (
+                f'<i>N</i> ≤ {fit.xc:.0f}：<i>δ</i> = {fit.a1:.4g}·<i>N</i><sup>2</sup>（弹性）<br>'
+                f'<i>N</i> &gt; {fit.xc:.0f}：<i>δ</i> = {fit.a2:.4g}·<i>N</i><sup>{fit.b2:.3f}</sup>（塑性）<br>'
+                f'最大弹性变形 = {fit.max_elastic_deformation:.6f} mm<br>')
+            formula_lines = [
+                f'N <= {fit.xc:.0f} : δ = {fit.a1:.6g} * N^2',
+                f'N > {fit.xc:.0f} : δ = {fit.a2:.6g} * N^{fit.b2:.4f}',
+            ]
+            heading = '弹塑性分段幂函数拟合'
+        else:
+            formula_html = (
+                f'<i>δ</i> = {fit.a1:.4g}·<i>N</i><sup>2</sup>（弹性模型）<br>'
+                f'尚未检出可靠塑性段；有效范围至 {fit.max_rpm:.0f} RPM<br>')
+            formula_lines = [
+                f'δ = {fit.a1:.6g} * N^2',
+                f'尚未检出可靠塑性段；有效范围至 {fit.max_rpm:.0f} RPM',
+            ]
+            heading = '弹性二次函数拟合'
         self.lbl_fit_result.setText(
-            f'<b>分段幂函数拟合</b><br>'
-            f'<i>N</i> &lt; {fit.xc:.0f}：<i>δ</i> = {fit.a1:.4g}·<i>N</i>&#8201;<sup>{fit.b1:.3f}</sup><br>'
-            f'<i>N</i> ≥ {fit.xc:.0f}：<i>δ</i> = {fit.a2:.4g}·<i>N</i>&#8201;<sup>{fit.b2:.3f}</sup><br>'
+            f'<b>{heading}</b><br>{formula_html}'
             f'确定系数 R² = {fit.r2:.4f}（{fit.n_points} 点）<br>'
             f'<span style="color:#8a96a6; font-size:13px;">'
-            f'（<i>δ</i>=变形 mm，<i>N</i>=转速 RPM）</span>'
-        )
+            f'（<i>δ</i>=变形 mm，<i>N</i>=转速 RPM；仅升速包络）</span>')
 
-        # 把拟合函数追加保存到本次采集的 CSV 末尾 (δ=变形μm, N=转速RPM)
+        # 沿用原有 CSV 末尾公式记录机制，不改原始列，不新增残余数据列。
         fit_lines = [
-            '',
-            '分段幂函数拟合（δ=变形mm, N=转速RPM）',
-            f'N < {fit.xc:.0f} : δ = {fit.a1:.6g} * N^{fit.b1:.4f}',
-            f'N >= {fit.xc:.0f} : δ = {fit.a2:.6g} * N^{fit.b2:.4f}',
+            '', f'{heading}（δ=变形mm, N=转速RPM）',
+            *formula_lines,
             f'确定系数 R² = {fit.r2:.4f} （{fit.n_points} 点）',
         ]
         saved = self.csv.append_fit(fit_lines)

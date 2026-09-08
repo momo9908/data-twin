@@ -232,7 +232,7 @@ def _build_measure_tab(form) -> QWidget:
     lay_b.addRow('采集时长(s):', form.cb_save_time)
 
     form.btn_fit = QPushButton('开始拟合')
-    form.btn_fit.setToolTip('用分段幂函数拟合当前采集的 转速-变形 数据, 在右图绘制拟合曲线')
+    form.btn_fit.setToolTip('仅对升速包络数据拟合：弹性段 a·n²，塑性段 p>2；同步重算实测残余变形')
     form.btn_fit.clicked.connect(form._btn_fit_click)
     lay_b.addRow(form.btn_fit)
 
@@ -298,7 +298,23 @@ def _build_measure_tab(form) -> QWidget:
     form.scatter_xy = pg.ScatterPlotItem(size=4, brush=pg.mkBrush('#9467bd'), pen=None)
     form.plotxy.addItem(form.scatter_xy)
     form.fit_curve = form.plotxy.plot([], [], pen=pg.mkPen('#d62728', width=2))
-    mid.addWidget(form.plotxy, 1)
+    form.residual_curve = form.plotxy.plot([], [], pen=pg.mkPen('#00897b', width=2),
+                                          connect='finite')
+    legend = form.plotxy.addLegend(offset=(-10, 10))
+    legend.addItem(form.scatter_xy, '实测总变形')
+    legend.addItem(form.fit_curve, '弹塑性拟合')
+    legend.addItem(form.residual_curve, '残余变形（实测差值）')
+    right = QVBoxLayout()
+    right.setContentsMargins(0, 0, 0, 0)
+    right.addWidget(form.plotxy, 1)
+    form.lbl_residual = QLabel('轮盘当前残余变形：—（待拟合判定）')
+    form.lbl_residual.setWordWrap(True)
+    form.lbl_residual.setAlignment(Qt.AlignCenter)
+    form.lbl_residual.setToolTip('按指定公式：实测变形减去分界点最大弹性变形；非卸载实测结果。仅用于升速包络。')
+    right.addWidget(form.lbl_residual)
+    right_widget = QWidget()
+    right_widget.setLayout(right)
+    mid.addWidget(right_widget, 1)
 
     layout.addLayout(mid, 1)
     return page

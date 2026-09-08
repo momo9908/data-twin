@@ -30,8 +30,10 @@ plot_manager.py
 """
 
 import os
+import math
 import pyqtgraph as pg
 import pyqtgraph.exporters  # noqa: F401  让 pg.exporters.ImageExporter 可用
+from elastic_plastic import measured_residual
 
 
 class PlotManager:
@@ -73,8 +75,18 @@ class PlotManager:
         self.fit_curve = None
         self._xs = []           # 累加的横坐标 (转速) 缓冲, 供拟合读取
         self._ys = []           # 累加的纵坐标 (变形) 缓冲
+        self.residual_curve = None
+        self.residual_label = None
+        self._residual_fit = None
+        self._rising = []
+        self._peak_rpm = -math.inf
+        self._fit_start = 0
+        self._residual_x = []
+        self._residual_y = []
+        self._residual_dirty = False
 
-    def attach(self, plotxy_widget, scatter_item, fit_curve=None) -> None:
+    def attach(self, plotxy_widget, scatter_item, fit_curve=None,
+               residual_curve=None, residual_label=None) -> None:
         """注入由 ui_builder 创建好的控件引用。
 
         Args:
@@ -91,6 +103,8 @@ class PlotManager:
         self.plotxy = plotxy_widget
         self.scatter_xy = scatter_item
         self.fit_curve = fit_curve
+        self.residual_curve = residual_curve
+        self.residual_label = residual_label
 
     def reset_for_new_run(self) -> None:
         """开始新一轮采集时调用: 清空散点、清空拟合线、复位坐标范围。
@@ -112,6 +126,10 @@ class PlotManager:
         self.scatter_xy.clear()
         self._xs.clear()
         self._ys.clear()
+        self._rising.clear()
+        self._peak_rpm = -math.inf
+        self._fit_start = 0
+        self.clear_residual_fit()
         if self.fit_curve is not None:
             self.fit_curve.setData([], [])
         self.plotxy.enableAutoRange()
@@ -139,6 +157,62 @@ class PlotManager:
         self.scatter_xy.addPoints(x=[float(temps) ** 2], y=[d_mm])
         self._xs.append(temps)
         self._ys.append(d_mm)
+        rpm = float(temps)
+        rising = math.isfinite(rpm) and rpm > 0 and rpm >= self._peak_rpm
+        if rising:
+            self._peak_rpm = rpm
+        self._rising.append(rising)
+        self._append_residual(rpm, d_mm, rising)
+
+    def get_rising_points(self):
+        """拟合仅用升速包络及同转速保载点；原始 get_points/CSV 不变。"""
+        indices = [i for i in range(self._fit_start, len(self._xs)) if self._rising[i]]
+        return [self._xs[i] for i in indices], [self._ys[i] for i in indices]
+
+    def _show_residual(self, value, state):
+        if self.residual_label is not None:
+            number = '—' if value is None else f'{value:.6f} mm'
+            self.residual_label.setText(f'轮盘当前残余变形：{number}（{state}）')
+
+    def _append_residual(self, rpm, deformation_mm, rising):
+        if not rising:
+            value, state = None, '非升速包络点，不作判定'
+        else:
+            value, state = measured_residual(self._residual_fit, rpm, deformation_mm)
+        self._show_residual(value, state)
+        if self._residual_fit is not None:
+            self._residual_x.append(rpm ** 2 if math.isfinite(rpm) else math.nan)
+            self._residual_y.append(math.nan if value is None else value)
+            self._residual_dirty = True
+
+    def refresh_residual_curve(self):
+        """沿用原有 5 Hz 绘图刷新，避免每个采集帧重画整条残余曲线。"""
+        if self._residual_dirty and self.residual_curve is not None:
+            self.residual_curve.setData(self._residual_x, self._residual_y, connect='finite')
+        self._residual_dirty = False
+
+    def set_residual_fit(self, fit):
+        """重新拟合后统一重算历史值，使用实测变形，而不是拟合曲线值。"""
+        self.clear_residual_fit()
+        self._residual_fit = fit
+        for i in range(self._fit_start, len(self._xs)):
+            self._append_residual(float(self._xs[i]), self._ys[i], self._rising[i])
+        self.refresh_residual_curve()
+
+    def clear_residual_fit(self):
+        self._residual_fit = None
+        self._residual_x.clear()
+        self._residual_y.clear()
+        self._residual_dirty = False
+        if self.residual_curve is not None:
+            self.residual_curve.setData([], [])
+        self._show_residual(None, '待拟合判定')
+
+    def residual_zero_changed(self):
+        """归零后不混用旧零点数据；不清除原始散点、原拟合图或 CSV。"""
+        self._fit_start = len(self._xs)
+        self._peak_rpm = -math.inf
+        self.clear_residual_fit()
 
     def get_points(self):
         """返回当前累加的 (转速, 变形) 原始点 (供分段幂函数拟合用)。
@@ -177,6 +251,7 @@ class PlotManager:
         """
         if self.fit_curve is not None:
             self.fit_curve.setData([], [])
+        self.clear_residual_fit()
 
     def auto_scale(self, temps: float, deformation: float) -> None:
         """5Hz 重申坐标自适应 (由 Timer2 调用), 使视图随数据点与拟合曲线自适应。
@@ -195,6 +270,7 @@ class PlotManager:
             改用 pyqtgraph 内置自动量程; 5Hz 重申是为防止用户交互(缩放/平移)后停在
             手动量程, 保持"始终自适应"。
         """
+        self.refresh_residual_curve()
         self.plotxy.enableAutoRange()
 
     def export_png(self, full_dir: str, test_no: str) -> str:
@@ -212,6 +288,7 @@ class PlotManager:
             - 失败时直接抛异常, 由调用方 (MainForm._btn_stop_click) 捕获并打印 [WARN]
               (行为与原 main_app.py:432-439 一致)
         """
+        self.refresh_residual_curve()
         exporter = pg.exporters.ImageExporter(self.plotxy.plotItem)
         bmp = os.path.join(full_dir, f'{test_no}.png')
         exporter.export(bmp)

@@ -38,6 +38,7 @@ from PyQt5.QtWidgets import (
 )
 import pyqtgraph as pg
 from square_plot_widget import SquarePlotWidget
+from speed_squared_axis import SpeedSquaredAxis
 
 from dic_analysis import (
     analyze_max_field, list_dic_files, available_metrics, to_cylindrical,
@@ -188,24 +189,24 @@ class DicAnalysisTab(QWidget):
         mid.addWidget(left_widget, 1)      # 与右图各给伸缩因子 1 → 左右严格中分
 
         # ===== 右半栏: 应变-转速 散点图 (累加, 悬停显示数值) =====
-        self.plot = SquarePlotWidget()
+        self.plot = SquarePlotWidget(axisItems={'bottom': SpeedSquaredAxis()})
         self.plot.setMinimumWidth(480)
-        self.plot.setLabel('bottom', '转速', units='RPM')
+        self.plot.setLabel('bottom', '转速平方', units='RPM²')
         self.plot.setLabel('left', '应变', units='%')
         self.plot.showGrid(x=True, y=True, alpha=0.3)
         legend = self.plot.addLegend(offset=(-10, 10))
         self._sc_mises = pg.ScatterPlotItem(
             pen=None, symbol='o', size=12, brush=pg.mkBrush('#d62728'),
             hoverable=True, hoverPen=pg.mkPen('k', width=1.5),
-            tip=lambda x, y, data: f'最大Mises等效应变\n转速 {x:.0f} RPM\n应变 {y:.6g} %')
+            tip=lambda x, y, data: f'最大Mises等效应变\n转速 {data:.0f} RPM\n应变 {y:.6g} %')
         self._sc_circ = pg.ScatterPlotItem(
             pen=None, symbol='s', size=12, brush=pg.mkBrush('#1f77b4'),
             hoverable=True, hoverPen=pg.mkPen('k', width=1.5),
-            tip=lambda x, y, data: f'平均周向应变\n转速 {x:.0f} RPM\n应变 {y:.6g} %')
+            tip=lambda x, y, data: f'平均周向应变\n转速 {data:.0f} RPM\n应变 {y:.6g} %')
         self._sc_radial = pg.ScatterPlotItem(
             pen=None, symbol='t', size=12, brush=pg.mkBrush('#2ca02c'),
             hoverable=True, hoverPen=pg.mkPen('k', width=1.5),
-            tip=lambda x, y, data: f'平均径向应变\n转速 {x:.0f} RPM\n应变 {y:.6g} %')
+            tip=lambda x, y, data: f'平均径向应变\n转速 {data:.0f} RPM\n应变 {y:.6g} %')
         for sc, nm in ((self._sc_mises, '最大Mises等效应变'),
                        (self._sc_circ, '平均周向应变'),
                        (self._sc_radial, '平均径向应变')):
@@ -441,7 +442,7 @@ class DicAnalysisTab(QWidget):
 
         Side Effects:
             - 对 self._sc_mises / _sc_circ / _sc_radial 调用 setData
-            - 横坐标取各记录的转速, 纵坐标取对应指标值
+            - 横坐标仅在绘制时平方；原始转速同时附在散点 data 中供悬停显示
         """
         def _xy(getter):
             xs, ys = [], []
@@ -456,9 +457,9 @@ class DicAnalysisTab(QWidget):
         xm, ym = _xy(lambda r: r.global_max.value if r.global_max else None)
         xc, yc = _xy(lambda r: r.circ_section.value if r.circ_section else None)
         xr, yr = _xy(lambda r: r.radial_section.value if r.radial_section else None)
-        self._sc_mises.setData(xm, ym)
-        self._sc_circ.setData(xc, yc)
-        self._sc_radial.setData(xr, yr)
+        self._sc_mises.setData([float(n) ** 2 for n in xm], ym, data=xm)
+        self._sc_circ.setData([float(n) ** 2 for n in xc], yc, data=xc)
+        self._sc_radial.setData([float(n) ** 2 for n in xr], yr, data=xr)
 
     def _on_clear(self):
         """[清空散点] 按钮: 清空累计记录并清空右图三条散点序列。

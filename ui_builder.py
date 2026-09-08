@@ -46,6 +46,7 @@ from public_para import g
 from dic_tab import DicAnalysisTab
 from vibration_tab import VibrationTab
 from square_plot_widget import SquarePlotWidget
+from speed_squared_axis import SpeedSquaredAxis
 
 
 # 全局样式 (浅色 + 蓝色主色, 参考疲劳寿命预测程序的现代观感)
@@ -285,12 +286,13 @@ def _build_measure_tab(form) -> QWidget:
     mid.addWidget(left_widget, 1)      # 与右图各给伸缩因子 1 → 左右严格中分
 
     # ---- 右半栏: 散点图 (变形量-转速) ----
-    form.plotxy = SquarePlotWidget(title='变形量-转速')
+    form.plotxy = SquarePlotWidget(title='变形量-转速平方',
+                                   axisItems={'bottom': SpeedSquaredAxis()})
     form.plotxy.setLabel('left', '变形量', units='mm')
     # 纵轴关闭自动 SI 前缀: 不足 1mm 的变形量按小数/科学计数显示,
     # 不再被自动套前缀缩放 (避免 "0.99 mm" 被显示成 "990 mmm" 之类)
     form.plotxy.getAxis('left').enableAutoSIPrefix(False)
-    form.plotxy.setLabel('bottom', '转速', units='RPM')
+    form.plotxy.setLabel('bottom', '转速平方', units='RPM²')
     form.plotxy.showGrid(x=True, y=True, alpha=0.3)
     form.plotxy.setMinimumWidth(440)
     form.scatter_xy = pg.ScatterPlotItem(size=4, brush=pg.mkBrush('#9467bd'), pen=None)

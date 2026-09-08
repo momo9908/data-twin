@@ -135,7 +135,8 @@ class PlotManager:
             - 变形量在本层统一 μm→mm (÷1000), 故下游拟合/曲线/公式也都是 mm
         """
         d_mm = deformation / 1000.0
-        self.scatter_xy.addPoints(x=[temps], y=[d_mm])
+        # 仅绘图用 n²；原始转速缓冲仍用于原有拟合模型。
+        self.scatter_xy.addPoints(x=[float(temps) ** 2], y=[d_mm])
         self._xs.append(temps)
         self._ys.append(d_mm)
 
@@ -160,10 +161,10 @@ class PlotManager:
             无
 
         Side Effects:
-            - fit_curve.setData(xs, ys); fit_curve 未 attach 时静默忽略
+            - 将原始转速 xs 平方后绘制，ys 及拟合模型不变；未 attach 时静默忽略
         """
         if self.fit_curve is not None:
-            self.fit_curve.setData(xs, ys)
+            self.fit_curve.setData([float(n) ** 2 for n in xs], ys)
 
     def clear_fit_curve(self) -> None:
         """清空拟合曲线 (拟合失败或复位时)。

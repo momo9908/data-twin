@@ -618,8 +618,8 @@ class MainForm(QMainWindow):
 
         if fit.plastic and fit.has_elastic_segment:
             formula_html = (
-                f'<i>N</i> ≤ {fit.xc:#.3g}：<i>δ</i> = {fit.a1:#.3g}·<i>N</i><sup>{fit.b1:#.3g}</sup>（弹性）<br>'
-                f'<i>N</i> &gt; {fit.xc:#.3g}：<i>δ</i> = {fit.a2:#.3g}·<i>N</i><sup>{fit.b2:#.3g}</sup>（塑性）<br>'
+                f'<i>N</i> ≤ {fit.xc:#.3g}：<i>δ</i> = {fit.a1:#.3g}·<i>N</i>&#8201;&#8201;<sup>{fit.b1:#.3g}</sup>（弹性）<br>'
+                f'<i>N</i> &gt; {fit.xc:#.3g}：<i>δ</i> = {fit.a2:#.3g}·<i>N</i>&#8201;&#8201;<sup>{fit.b2:#.3g}</sup>（塑性）<br>'
                 f'最大弹性变形 = {fit.max_elastic_deformation:#.3g} mm<br>')
             formula_lines = [
                 f'N <= {fit.xc:.0f} : δ = {fit.a1:.6g} * N^{fit.b1:.12g}',
@@ -628,7 +628,7 @@ class MainForm(QMainWindow):
             heading = '弹塑性分段幂函数拟合'
         elif fit.plastic:
             formula_html = (
-                f'<i>δ</i> = {fit.a1:#.3g}·<i>N</i><sup>{fit.b1:#.3g}</sup>（塑性模型）<br>'
+                f'<i>δ</i> = {fit.a1:#.3g}·<i>N</i>&#8201;&#8201;<sup>{fit.b1:#.3g}</sup>（塑性模型）<br>'
                 '幂指数 &gt; 2.1；缺少弹性分界点，残余变形待判定<br>')
             formula_lines = [
                 f'δ = {fit.a1:.6g} * N^{fit.b1:.12g}',
@@ -637,7 +637,7 @@ class MainForm(QMainWindow):
             heading = '塑性幂函数拟合（缺少弹性段）'
         else:
             formula_html = (
-                f'<i>δ</i> = {fit.a1:#.3g}·<i>N</i><sup>{fit.b1:#.3g}</sup>（弹性模型）<br>'
+                f'<i>δ</i> = {fit.a1:#.3g}·<i>N</i>&#8201;&#8201;<sup>{fit.b1:#.3g}</sup>（弹性模型）<br>'
                 f'尚未检出可靠塑性段；有效范围至 {fit.max_rpm:#.3g} RPM<br>')
             formula_lines = [
                 f'δ = {fit.a1:.6g} * N^{fit.b1:.12g}',

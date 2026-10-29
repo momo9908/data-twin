@@ -7,11 +7,12 @@ ui_builder.py
     提供唯一入口函数 build_main_ui(form), 在传入的 form (MainForm 实例) 上构建:
         - 全局浅色蓝调样式 (APP_QSS)
         - 菜单栏 (设置 / 帮助)
-        - 一个 QTabWidget, 含三个功能选项卡:
+        - 一个 QTabWidget, 含四个功能选项卡:
             * 「径向位移测量」: 原实时采集界面 (4 指示器 + 散点图 + 3 控制分组)
             * 「振动信号分析」: vibration_tab.VibrationTab (复刻 Delphi 振动链路,
               与径向页共享同一采集会话)
             * 「DIC 应变分析」: dic_tab.DicAnalysisTab (离线全场最大值分析, 内联展示)
+            * 「轮盘参数设置」: 材料曲线导入/换算及轮盘参数保存
         - 2 个定时器 (timer1 100ms 单次, timer2 200ms 周期)
 
     实时测量相关的全部控件仍挂到 form.<name> (名称与历史版本一致), 因此 MainForm
@@ -45,6 +46,7 @@ import pyqtgraph as pg
 from public_para import g
 from dic_tab import DicAnalysisTab
 from vibration_tab import VibrationTab
+from disc_parameters_tab import DiscParametersTab
 from square_plot_widget import SquarePlotWidget
 from speed_squared_axis import SpeedSquaredAxis
 
@@ -394,6 +396,10 @@ def build_main_ui(form) -> None:
     # 选项卡 3: DIC 应变分析 (离线全场最大值, 内联展示, 无弹窗)
     form.dic_tab = DicAnalysisTab(form.exe_directory)
     form.tabs.addTab(form.dic_tab, 'DIC 应变分析')
+
+    # 新页独立管理材料数据与轮盘参数，不参与原采集/分析会话。
+    form.disc_parameters_tab = DiscParametersTab(form.exe_directory)
+    form.tabs.addTab(form.disc_parameters_tab, '轮盘参数设置')
 
     # ============================================================
     # 定时器

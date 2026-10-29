@@ -105,10 +105,11 @@ class DiscParametersTab(QWidget):
         row_file.addWidget(self.btn_import)
         file_layout.addLayout(row_file)
 
-        self.lbl_detection = QLabel('自动识别文件格式、数据列、单位和起始行，导入后直接绘图。')
+        self.lbl_detection = QLabel()
         self.lbl_detection.setWordWrap(True)
         self.lbl_detection.setTextInteractionFlags(Qt.TextSelectableByMouse)
         file_layout.addWidget(self.lbl_detection)
+        self.lbl_detection.hide()
         self.table_preview = QTableWidget(0, 0)
         self.table_preview.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table_preview.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -141,6 +142,7 @@ class DiscParametersTab(QWidget):
         self.lbl_parameters = QLabel('')
         self.lbl_parameters.setWordWrap(True)
         parameters_form.addRow(self.lbl_parameters)
+        self.lbl_parameters.hide()
         for editor in (self.edit_diameter, self.edit_circumferential, self.edit_radial):
             editor.textEdited.connect(self._mark_parameters_dirty)
             editor.editingFinished.connect(self._autosave_parameters)
@@ -167,11 +169,6 @@ class DiscParametersTab(QWidget):
         middle.addWidget(scroll, 1)
 
         right = QVBoxLayout()
-        formula = QLabel('σ<sub>t</sub> = σ<sub>e</sub>(ε<sub>e</sub> + 1)　　'
-                         'ε<sub>t</sub> = ln(ε<sub>e</sub> + 1)')
-        formula.setAlignment(Qt.AlignCenter)
-        formula.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        right.addWidget(formula)
         self.plot = SquarePlotWidget(background='w')
         self.plot.setMinimumWidth(460)
         self.plot.setLabel('bottom', '应变（无量纲）', **{'color': '#202020', 'font-size': '12pt'})
@@ -189,10 +186,11 @@ class DiscParametersTab(QWidget):
         self.true_curve = self.plot.plot([], [], name='真实应力—应变',
                                          pen=pg.mkPen('#d84315', width=2.2))
         right.addWidget(self.plot, 1)
-        self.lbl_summary = QLabel('导入工程应力—应变数据后，按上方公式转换全部有效数据点。')
+        self.lbl_summary = QLabel()
         self.lbl_summary.setWordWrap(True)
         self.lbl_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
         right.addWidget(self.lbl_summary)
+        self.lbl_summary.hide()
         middle.addLayout(right, 1)
         root.addLayout(middle, 1)
 
@@ -308,6 +306,7 @@ class DiscParametersTab(QWidget):
         if result.notes:
             details += ' '+'；'.join(result.notes)
         self.lbl_detection.setText(details)
+        self.lbl_detection.show()
         self.table_preview.setRowCount(len(preview.rows))
         self.table_preview.setColumnCount(len(preview.column_labels))
         self.table_preview.setHorizontalHeaderLabels(
@@ -362,18 +361,20 @@ class DiscParametersTab(QWidget):
         if curve.warnings:
             summary += ' '+'；'.join(curve.warnings)
         self.lbl_summary.setText(summary)
+        self.lbl_summary.show()
         self._set_status('转换完成。两条曲线按全部有效数据点及原始行序绘制，可导出 CSV 或高清图片。')
 
     def _restore_parameters(self):
         try:
             self._parameters = load_disc_parameters(self.parameters_path)
             existed = os.path.exists(self.parameters_path)
-            self.lbl_parameters.setText('已恢复上次保存的参数。' if existed else '首次使用默认值为 1；编辑完成后自动保存。')
+            self.lbl_parameters.setText('已恢复上次保存的参数。' if existed else '')
         except Exception as exc:
             self._parameters = DiscParameters()
             self._restore_failed = True
             self.lbl_parameters.setText('参数文件无法读取，当前使用默认值 1：'+str(exc))
             self.lbl_parameters.setStyleSheet('color:#b42318;')
+        self.lbl_parameters.setVisible(bool(self.lbl_parameters.text()))
         for editor, value in ((self.edit_diameter, self._parameters.outer_diameter_mm),
                               (self.edit_circumferential, self._parameters.circumferential_coefficient),
                               (self.edit_radial, self._parameters.radial_coefficient)):
@@ -409,10 +410,12 @@ class DiscParametersTab(QWidget):
             self._restore_failed = False
             self.lbl_parameters.setText('参数已保存，下次启动自动恢复。')
             self.lbl_parameters.setStyleSheet('color:#53657b;')
+            self.lbl_parameters.show()
             return True
         except Exception as exc:
             self.lbl_parameters.setText('参数未保存：'+str(exc))
             self.lbl_parameters.setStyleSheet('color:#b42318;')
+            self.lbl_parameters.show()
             return False
 
     def _default_export_path(self, suffix):
